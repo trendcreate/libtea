@@ -5,12 +5,12 @@ Copyright (C) 2021 TrendCreate
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 3 of the License, or 
+the Free Software Foundation; either version 3 of the License, or
 (at your option) any later version.
 
-This program is distributed in the hope that it will be useful, 
+This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
@@ -28,6 +28,12 @@ use tokio::{
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
+    println!("This program comes with ABSOLUTELY NO WARRANTY; for details watch lines 589-619 of the LICENSE file.");
+    println!("This is free software, and you are welcome to redistribute it");
+    println!("under certain conditions; lines 195-341 of the LICENSE file for details.");
+    println!();
+
     let mut home = dirs::home_dir().unwrap();
     home.push(".config");
     home.push("RYOKUCHAT");
