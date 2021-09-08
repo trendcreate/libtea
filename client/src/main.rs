@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
     println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
     println!("This program comes with ABSOLUTELY NO WARRANTY; for details watch lines 589-619 of the LICENSE file.");
     println!("This is free software, and you are welcome to redistribute it");
-    println!("under certain conditions; lines 195-341 of the LICENSE file for details.");
+    println!("under certain conditions; watch lines 195-341 of the LICENSE file for details.");
     println!();
 
     let mut home = dirs::home_dir().unwrap();
