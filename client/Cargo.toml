@@ -24,8 +24,10 @@ edition = "2018"
 
 [dependencies]
 tokio-socks = "0.5"
-libtor = "46"
 dirs = "3.0"
+base64 = "0.13"
+libtor = "46"
+#libtorに合わせて更新
 openssl = { version = "0.10", features = ["vendored"]} 
 # ed448-rustに合わせて更新
 rand = "0.8"

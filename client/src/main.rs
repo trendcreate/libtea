@@ -17,14 +17,49 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use std::{convert::TryFrom, thread::sleep_ms};
+use std::{
+    convert::TryFrom,
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 
 use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    net::TcpListener,
     process::Command,
 };
+
+struct SessionData(Option<SessionDataSome>);
+
+impl Deref for SessionData {
+    type Target = SessionDataSome;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            Some(s) => s,
+            None => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+}
+
+impl DerefMut for SessionData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.0 {
+            Some(s) => s,
+            None => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+}
+
+struct SessionDataSome {
+    myaddress: String,
+    myprivkey: ed448_rust::PrivateKey,
+    address_book: Vec<String>,
+}
+
+static DATA: tokio::sync::RwLock<SessionData> = tokio::sync::RwLock::const_new(SessionData(None));
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -89,22 +124,64 @@ async fn main() -> std::io::Result<()> {
             Some(TorAddress::AddressPort("[::1]".to_string(), 4545)).into(),
         ))
         .start_background();
-    loop {
-        match tokio_socks::tcp::Socks5Stream::connect(
-            "[::1]:4546",
-            "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion:80",
-        )
-        .await
-        {
-            Ok(_) => {
-                println!("接続成功!");
-                break;
+
+    *DATA.write().await = SessionData(Some(SessionDataSome {
+        myprivkey: secretkey,
+        address_book: Vec::new(), //stub
+        myaddress: {
+            home.push("hostname");
+            let mut userid =
+                base64::encode_config(publickey.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
+            userid.push('@');
+            let mut hostname = String::new();
+            loop {
+                if let Ok(mut o) = fs::File::open(&home).await {
+                    o.read_to_string(&mut hostname).await?;
+                    if hostname.trim().ends_with(".onion") {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            Err(e) => {
-                eprintln!("{}", e);
-                sleep_ms(1000);
-            }
-        }
-    }
+            userid.push_str(hostname.trim());
+            userid
+        },
+    }));
+    mainmenu().await;
     Ok(())
+}
+
+async fn mainmenu() -> ! {
+    let listen = TcpListener::bind("[::1]:4545").await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let _ = match listen.accept().await {
+                Ok((o, _)) => tokio::spawn(async move {
+                    let stream = BufStream::new(o);
+                }),
+                Err(_) => continue,
+            };
+        }
+    });
+    loop {
+        let data = DATA.read().await;
+        println!("Your address is: {}", &data.myaddress);
+    }
+    // loop {
+    //     match tokio_socks::tcp::Socks5Stream::connect(
+    //         "[::1]:4546",
+    //         "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion:80",
+    //     )
+    //     .await
+    //     {
+    //         Ok(_) => {
+    //             println!("接続成功!");
+    //             break;
+    //         }
+    //         Err(e) => {
+    //             eprintln!("{}", e);
+    //             tokio::time::sleep(Duration::from_secs(1)).await;
+    //         }
+    //     }
+    // }
 }
