@@ -144,17 +144,17 @@ async fn init() -> Result<(), Box<dyn std::error::Error>> {
         .start_background();
 
     home.pop();
-    home.push("AddressBook.tea");
+    home.push("AddressBook.ron");
     let mut addressbook = String::new();
     try_open_read(&home, |mut f| async move {
-        f.write_all(toml::to_string(&UserDatas(Vec::new()))?.as_bytes())
+        f.write_all(ron::to_string(&UserDatas(Vec::new()))?.as_bytes())
             .await?;
         Ok(())
     })
     .await?
     .read_to_string(&mut addressbook)
     .await?;
-    let addressbook: VecDeque<Arc<UserData>> = toml::from_str::<UserDatas>(&addressbook)?
+    let addressbook: VecDeque<Arc<UserData>> = ron::from_str::<UserDatas>(&addressbook)?
         .0
         .into_iter()
         .map(|a| {
@@ -221,10 +221,9 @@ async fn mainmenu() -> ! {
             };
         }
     });
-    loop {
-        let data = DATA.read().await;
-        println!("Your address is: {}", &data.myaddress);
-    }
+    let data = DATA.read().await;
+    println!("Your address is: {}", &data.myaddress);
+    loop {}
     // loop {
     //     match tokio_socks::tcp::Socks5Stream::connect(
     //         "[::1]:4546",
