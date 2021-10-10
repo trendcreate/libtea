@@ -18,6 +18,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
 use std::{
+    cell::UnsafeCell,
     collections::{HashMap, VecDeque},
     convert::TryFrom,
     future::Future,
@@ -26,55 +27,37 @@ use std::{
     time::Duration,
 };
 
-use ed448_rust::PublicKey;
-use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::TcpListener,
-    process::Command,
-};
-
-struct SessionData<'a>(Option<SessionDataSome<'a>>);
+struct SessionData<'a>(UnsafeCell<Option<SessionDataSome<'a>>>, UnsafeCell<bool>);
 
 impl<'a> Deref for SessionData<'a> {
     type Target = SessionDataSome<'a>;
 
     fn deref(&self) -> &Self::Target {
-        match &self.0 {
-            Some(s) => s,
-            None => unsafe { std::hint::unreachable_unchecked() },
+        unsafe {
+            match &*self.0.get() {
+                Some(s) => s,
+                None => std::hint::unreachable_unchecked(),
+            }
         }
     }
 }
 
-impl<'a> DerefMut for SessionData<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match &mut self.0 {
-            Some(s) => s,
-            None => unsafe { std::hint::unreachable_unchecked() },
+#[allow(clippy::mut_from_ref)]
+impl<'a> SessionData<'a> {
+    unsafe fn set(&'a self) -> &'a mut Option<SessionDataSome> {
+        if *self.1.get() {
+            panic!("errorcode: 1");
+        } else {
+            *self.1.get() = true;
+            &mut *(self.0.get())
         }
     }
 }
 
-// (Address, Name)
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UserDatas(Vec<(String, Option<String>)>);
+unsafe impl<'a> std::marker::Sync for SessionData<'a> {}
+unsafe impl<'a> std::marker::Send for SessionData<'a> {}
 
-struct SessionDataSome<'a> {
-    myaddress: String,
-    myprivkey: ed448_rust::PrivateKey,
-    address_to_data: HashMap<&'a PublicKey, Arc<UserData>>,
-    number_to_data: VecDeque<Arc<UserData>>,
-}
-
-struct UserData {
-    hostname: String,
-    username: Option<String>,
-    key: PublicKey,
-}
-
-static DATA: tokio::sync::RwLock<SessionData> = tokio::sync::RwLock::const_new(SessionData(None));
+static DATA: SessionData = SessionData(UnsafeCell::new(None), UnsafeCell::new(false));
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -84,128 +67,8 @@ async fn main() -> std::io::Result<()> {
     println!("under certain conditions; watch lines 195-341 of the LICENSE file for details.");
     println!();
 
-    init().await.unwrap();
-    mainmenu().await;
-    Ok(())
-}
+    let session = libtea::RYOKUCHATSession::new(dirs::home_dir().unwrap(), 4546, 4545).await;
 
-async fn init() -> Result<(), Box<dyn std::error::Error>> {
-    let mut home = dirs::home_dir().unwrap();
-    home.push(".config");
-    home.push("RYOKUCHAT");
-    home.push("tor");
-    let _ = fs::create_dir_all(&home).await;
-    home.pop();
-
-    home.push("DO_NOT_SEND_TO_OTHER_PEOPLE_secretkey.ykr");
-    let mut secretkey: [u8; 57] = [0; 57];
-
-    try_open_read(&home, |mut f| async move {
-        println!("Initial setting...");
-        f.write_all(ed448_rust::PrivateKey::new(&mut rand::rngs::OsRng).as_bytes())
-            .await?;
-        Ok(())
-    })
-    .await?
-    .read_exact(&mut secretkey)
-    .await?;
-    let secretkey = ed448_rust::PrivateKey::try_from(&secretkey)?;
-    let publickey = ed448_rust::PublicKey::try_from(&secretkey)?;
-    home.pop();
-
-    #[cfg(not(target_os = "windows"))]
-    Command::new("chmod")
-        .arg("-R")
-        .arg("700")
-        .arg(home.to_str().unwrap())
-        .spawn()?
-        .wait()
-        .await?;
-
-    home.push("tor");
-
-    Tor::new()
-        .flag(TorFlag::Quiet())
-        .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
-        .flag(TorFlag::StrictNodes(true.into()))
-        .flag(TorFlag::SocksPortAddress(
-            TorAddress::AddressPort("[::1]".to_string(), 4546),
-            None.into(),
-            None.into(),
-        ))
-        .flag(TorFlag::HiddenServiceDir(
-            home.to_str().unwrap().to_string(),
-        ))
-        .flag(TorFlag::HiddenServiceVersion(HiddenServiceVersion::V3))
-        .flag(TorFlag::HiddenServicePort(
-            TorAddress::Port(4545),
-            Some(TorAddress::AddressPort("[::1]".to_string(), 4545)).into(),
-        ))
-        .start_background();
-
-    home.pop();
-    home.push("AddressBook.ron");
-    let mut addressbook = String::new();
-    try_open_read(&home, |mut f| async move {
-        f.write_all(ron::to_string(&UserDatas(Vec::new()))?.as_bytes())
-            .await?;
-        Ok(())
-    })
-    .await?
-    .read_to_string(&mut addressbook)
-    .await?;
-    let addressbook: VecDeque<Arc<UserData>> = ron::from_str::<UserDatas>(&addressbook)?
-        .0
-        .into_iter()
-        .map(|a| {
-            let mut address = a.0.split('@');
-            Arc::new(UserData {
-                key: ed448_rust::PublicKey::try_from(
-                    base64::decode_config(address.next().unwrap(), base64::URL_SAFE_NO_PAD)
-                        .unwrap()
-                        .as_slice(),
-                )
-                .unwrap(),
-                hostname: address.next().unwrap().to_string(),
-                username: a.1,
-            })
-        })
-        .collect();
-
-    *DATA.write().await = SessionData(Some(SessionDataSome {
-        myprivkey: secretkey,
-        myaddress: {
-            home.pop();
-            home.push("tor");
-            home.push("hostname");
-            let mut userid =
-                base64::encode_config(publickey.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
-            userid.push('@');
-            let mut hostname = String::new();
-            loop {
-                if let Ok(mut o) = fs::File::open(&home).await {
-                    o.read_to_string(&mut hostname).await?;
-                    if hostname.trim().ends_with(".onion") {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            userid.push_str(hostname.trim());
-            userid
-        },
-        address_to_data: {
-            let mut data = HashMap::new();
-            for i in &addressbook {
-                data.insert(
-                    unsafe { std::mem::transmute::<&PublicKey, &PublicKey>(&i.key) },
-                    Arc::clone(i),
-                );
-            }
-            data
-        },
-        number_to_data: addressbook,
-    }));
     Ok(())
 }
 
@@ -221,9 +84,36 @@ async fn mainmenu() -> ! {
             };
         }
     });
-    let data = DATA.read().await;
-    println!("Your address is: {}", &data.myaddress);
-    loop {}
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut input = String::new();
+    loop {
+        println!("Your address is: {}", &DATA.myaddress);
+        println!("/help to command list.");
+        println!("Input index of friend or command.");
+        let mut temp: usize = 0;
+        let mut data = DATA.number_to_data.write().await;
+        for i in &*data {
+            match &*i.username.read().await {
+                Some(s) => println!("{}. {}", temp, s),
+                None => println!("no_name ({})", i.hostname),
+            }
+            temp += 1;
+        }
+
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all("RYOKUCHAT> ".as_bytes()).await.unwrap();
+        stdout.flush().await.unwrap();
+        drop(stdout);
+
+        stdin.read_line(&mut input).await.unwrap();
+        match command_execute(&input).await {
+            Some(s) => {
+                let _ = s.await;
+            }
+            None => {}
+        }
+        println!();
+    }
     // loop {
     //     match tokio_socks::tcp::Socks5Stream::connect(
     //         "[::1]:4546",
@@ -241,6 +131,78 @@ async fn mainmenu() -> ! {
     //         }
     //     }
     // }
+}
+
+#[allow(clippy::manual_strip)]
+async fn command_execute(
+    command: &str,
+) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>>>>> {
+    let command = command.trim();
+    if command.starts_with('/') {
+        if command.len() > 1 {
+            let mut command = command[1..].split(' ');
+            match command.next().unwrap() {
+                "add" => {
+                    let arg = match command.next() {
+                        Some(s) => s,
+                        None => {
+                            println!("Requires an argument.");
+                            return None;
+                        }
+                    }
+                    .to_string();
+                    Some(Box::pin(async move {
+                        if let Some(s) = decode_address(&arg) {
+                            let s = Arc::new(s);
+                            DATA.number_to_data.write().await.push_front(Arc::clone(&s));
+                            unsafe {
+                                DATA.address_to_data.write().await.insert(
+                                    std::mem::transmute::<&PublicKey, &PublicKey>(&s.key),
+                                    Arc::clone(&s),
+                                );
+                            }
+                            println!("Command succeeded.");
+                        } else {
+                            println!("Wrong argument format.");
+                        }
+                        Ok(())
+                    }))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn decode_address(address: &str) -> Option<UserData> {
+    let mut address = address.split('@');
+    Some(UserData {
+        key: match ed448_rust::PublicKey::try_from(
+            match base64::decode_config(
+                match address.next() {
+                    Some(s) => s,
+                    None => return None,
+                },
+                base64::URL_SAFE_NO_PAD,
+            ) {
+                Ok(o) => o,
+                Err(_) => return None,
+            }
+            .as_slice(),
+        ) {
+            Ok(o) => o,
+            Err(_) => return None,
+        },
+        hostname: match address.next() {
+            Some(s) => s.to_string(),
+            None => return None,
+        },
+        username: RwLock::const_new(None),
+    })
 }
 
 async fn try_open_read<

@@ -18,6 +18,6 @@
 [workspace]
 
 members = [
-    "client",
-    "keymake_debug"
+    "libtea",
+    #"client"
 ]

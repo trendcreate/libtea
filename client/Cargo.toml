@@ -23,23 +23,14 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ron = "0.6"
 tokio-socks = "0.5"
 dirs = "3.0"
-base64 = "0.13"
-libtor = "46"
 openssl = { version = "*", features = ["vendored"]} 
-# ed448-rustに合わせて更新
-rand = "0.8"
+
+[dependencies.libtea]
+path = "../libtea"
 
 [dependencies.tokio]
 version = "1"
 default-features = true
 features = ["full"]
-
-[dependencies.ed448-rust]
-git = "https://github.com/WinLinux1028/ed448-rust.git"
-
-[dependencies.serde]
-version = "*"
-features = ["derive"]

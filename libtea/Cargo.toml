@@ -1,0 +1,27 @@
+[package]
+name = "libtea"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libtor = "46"
+base64 = "0.13"
+byteorder = "1"
+ron = "0.6"
+# ed448-rustに合わせて更新
+rand = "0.8"
+
+# ronに合わせて更新
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[dependencies.ed448-rust]
+git = "https://github.com/WinLinux1028/ed448-rust.git"
+
+[dependencies.tokio]
+version = "1"
+default-features = true
+features = ["full"]
