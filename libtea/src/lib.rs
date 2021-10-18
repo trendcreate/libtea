@@ -60,7 +60,6 @@ impl<'a> RYOKUCHATSession<'a> {
             Tor::new()
                 .flag(TorFlag::Quiet())
                 .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
-                .flag(TorFlag::StrictNodes(true.into()))
                 .flag(TorFlag::SocksPortAddress(
                     TorAddress::AddressPort("[::1]".to_string(), socks_port),
                     None.into(),
@@ -169,8 +168,8 @@ impl<'a> RYOKUCHATSession<'a> {
                 match listen.accept().await {
                     Ok((o, _)) => tokio::spawn(async move {
                         let mut stream = BufStream::new(o);
-                        // 57バイトの公開鍵と114バイトの署名
-                        let mut buf = [0; 57 + 114];
+                        // 57バイトの公開鍵(ID)と8バイトのメッセージと114バイトの署名
+                        let mut buf = [0; 57 + 8 + 114];
                         match stream.read_exact(&mut buf).await {
                             Ok(_) => (),
                             Err(_) => return,
@@ -181,7 +180,10 @@ impl<'a> RYOKUCHATSession<'a> {
                         };
                         // 連絡先リストに相手のアドレスがあることを確認
                         if let Some(s) = session.userid_to_data.write().await.get(&key) {
-                            if s.id.verify(&buf[0..57], &buf[57..], None).is_ok() {
+                            if s.id
+                                .verify(&buf[57..57 + 8], &buf[57 + 8..57 + 8 + 114], None)
+                                .is_ok()
+                            {
                                 let (mut read, write) = tokio::io::split(stream);
                                 *s.send.lock().await = Some(write);
                                 *s.handle.lock().await =
@@ -209,7 +211,22 @@ impl<'a> RYOKUCHATSession<'a> {
         self.number_to_data.read().await.clone()
     }
 
-    pub async fn add_user(address: &str) {}
+    pub async fn add_user(&self, address: &str) -> Option<()> {
+        match decode_address(address) {
+            Some(s) => {
+                let s = Arc::new(s);
+                self.number_to_data.write().await.push_front(Arc::clone(&s));
+                unsafe {
+                    self.userid_to_data.write().await.insert(
+                        std::mem::transmute::<&PublicKey, &PublicKey>(&s.id),
+                        Arc::clone(&s),
+                    );
+                }
+                Some(())
+            }
+            None => None,
+        }
+    }
 }
 
 pub struct UserData {
