@@ -16,22 +16,36 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
     process::Command,
-    sync::{mpsc::Sender, Mutex, RwLock, RwLockReadGuard},
+    sync::{mpsc::Sender, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     task::JoinHandle,
 };
 
+/// libteaのセッションです  
+/// newメソッドを使うことで生成できます  
+/// notifyのMutexの中身を書き換えることで新規メッセージの通知を受け取ることができます  
+/// myaddressには自分のアドレスが入っており、共有することで他の人と通信することができます  
 pub struct RYOKUCHATSession<'a> {
     handles: Vec<HandleWrapper>,
     myprivkey: PrivateKey,
     number_to_data: RwLock<VecDeque<Arc<UserData>>>,
     userid_to_data: RwLock<HashMap<&'a PublicKey, Arc<UserData>>>,
-    pub notify: Mutex<Option<Sender<Notify>>>,
+    pub notify: Mutex<Option<Sender<Message>>>,
     pub myaddress: String,
 }
 
-const MAXMSGLEN: usize = 125000 - 8;
+/// メッセージの最大の長さです  
+/// 125000バイトからヘッダーの187バイトを引いたものです  
+pub const MAXMSGLEN: usize = 125000 - 57 - 8 - 114 - 8;
 
 impl<'a> RYOKUCHATSession<'a> {
+    /// 動作の説明:  
+    /// 新しくRYOKUCHATSessionを作ります  
+    /// 引数について:  
+    /// 1: libteaのデータを設置する場所をPathBufで指定します  
+    /// 2: Torが使うSocksプロキシのポートを指定します  
+    /// 3: Tor Hidden Serviceを経由して送られてきたリクエストを受け付けるためのポートを指定します  
+    /// 返り値について:  
+    /// Boxで包まれたRYOKUCHATSessionが返ってきます  
     pub async fn new(
         mut data_dir: PathBuf,
         socks_port: u16,
@@ -123,6 +137,7 @@ impl<'a> RYOKUCHATSession<'a> {
         // ユーザーIDからそれに対応するデータを引けるHashMapを作る
         let mut userid_to_data = HashMap::new();
         for i in &addressbook {
+            // ライフタイムを騙しているが、addressbookの中のiはヒープ上にあり、addressbook自体もuserid_to_dataと一緒にRYOKUCHATSessionに格納されるため安全
             unsafe {
                 userid_to_data.insert(
                     std::mem::transmute::<&PublicKey, &PublicKey>(&i.id),
@@ -160,10 +175,13 @@ impl<'a> RYOKUCHATSession<'a> {
         });
 
         // メッセージを受信するスレッドを作る
+        // ライフタイムエラーを消すためにtransmuteを使っているが、RYOKUCHATSessionには書き換えられうる値にはMutexやRwLockを使っており、RYOKUCHATSessionの実体はヒープ上にあるので安全
         let s = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(&*session) };
         let handle = tokio::spawn(async move {
             let session = s;
-            let listen = TcpListener::bind("[::1]:4545").await.unwrap();
+            let listen = TcpListener::bind(format!("[::1]:{}", ryokuchat_port))
+                .await
+                .unwrap();
             loop {
                 match listen.accept().await {
                     Ok((o, _)) => tokio::spawn(async move {
@@ -207,15 +225,44 @@ impl<'a> RYOKUCHATSession<'a> {
         session
     }
 
+    /// 動作の説明:  
+    /// 連絡先リストをロックし取得します  
+    /// 返り値について:  
+    /// RwLockWriteGuardで包まれたVecDequeで連絡先が返ってきます  
+    /// 注意点:  
+    /// このメソッドで取得した連絡先はdropされない限り読み書き要求を永久にブロックし続けます  
+    /// パフォーマンスに影響するため、使い終わったらすぐにdrop()を使ってドロップしてください  
+    pub async fn get_users_and_lock(&'a self) -> RwLockWriteGuard<'a, VecDeque<Arc<UserData>>> {
+        self.number_to_data.write().await
+    }
+
+    /// 動作の説明:  
+    /// 実行された時点での連絡先リストを取得します  
+    /// 返り値について:  
+    /// VecDequeでArcに包まれたUserDataが返ってきます  
+    /// 注意点:  
+    /// get_users_and_lockのようにロックしたりはしませんが、内部の連絡先リストと同期はされないため自分で変更を適用してください  
     pub async fn get_users(&self) -> VecDeque<Arc<UserData>> {
         self.number_to_data.read().await.clone()
     }
 
+    pub async fn get_user_from_id(id: &PublicKey) {}
+
+    /// 動作の説明:  
+    /// 連絡先リストにユーザーを追加します  
+    /// 引数について:  
+    /// 引数には&str型でアドレスを入れてください  
+    /// アドレスは以下のような形式になります  
+    /// (ユーザーID)@(Tor Hidden Serviceのドメイン名)  
+    /// 返り値について:  
+    /// 成功ならばSome(())、失敗ならばNoneが返ります  
     pub async fn add_user(&self, address: &str) -> Option<()> {
         match decode_address(address) {
             Some(s) => {
                 let s = Arc::new(s);
                 self.number_to_data.write().await.push_front(Arc::clone(&s));
+
+                // ライフタイムを騙しているが、sの実体はヒープ上にあり、sをcloneしたものはRYOKUCHATSessionが消えるまで存在し続けるため安全
                 unsafe {
                     self.userid_to_data.write().await.insert(
                         std::mem::transmute::<&PublicKey, &PublicKey>(&s.id),
@@ -227,11 +274,24 @@ impl<'a> RYOKUCHATSession<'a> {
             None => None,
         }
     }
+
+    /// 動作の説明:  
+    /// 連絡先リストからユーザーを削除します  
+    ///
+    pub async fn del_user(
+        &self,
+        index: usize,
+        data: &mut RwLockWriteGuard<'a, VecDeque<Arc<UserData>>>,
+    ) {
+        data.remove(index);
+    }
 }
 
+/// 連絡先リストに含まれるユーザーのデータです
+/// idにはそのユーザーのIDが内部表現で入っています  
 pub struct UserData {
     pub id: PublicKey,
-    pub hostname: String,
+    hostname: String,
     // stub: ユーザーネームを取得できるようにする
     username: RwLock<Option<String>>,
     send: Mutex<Option<WriteHalf<BufStream<TcpStream>>>>,
@@ -239,12 +299,29 @@ pub struct UserData {
 }
 
 impl UserData {
+    /// 動作の説明:  
+    /// ユーザー名を取得します  
+    /// 注意点:  
+    /// ユーザー名の領域をロックするため、なるべく早くdrop()してください  
     pub async fn get_username(&'_ self) -> RwLockReadGuard<'_, Option<String>> {
         self.username.read().await
     }
+
+    /// 動作の説明:  
+    /// アドレスを取得します  
+    /// アドレスのフォーマットは(ユーザーID)@(Tor Hidden Serviceのホスト名)です  
+    pub async fn get_address(&self) -> String {
+        let mut address =
+            base64::encode_config(self.id.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
+        address.push_str(&self.hostname);
+        address
+    }
 }
 
-pub enum Notify {
+/// メッセージを受信するときに使います
+pub enum Message {
+    /// 新しい通常のメッセージが来た場合の情報を格納します  
+    /// 1つ目にユーザーID、2つ目にメッセージが入ります  
     NewMsg(PublicKey, String),
 }
 
@@ -303,7 +380,7 @@ async fn process_message(
                         match &mut *session.notify.lock().await {
                             Some(s) => {
                                 let userid = userid.clone();
-                                let _ = s.send(Notify::NewMsg(userid, msg.to_string())).await;
+                                let _ = s.send(Message::NewMsg(userid, msg.to_string())).await;
                             }
                             None => (),
                         }
