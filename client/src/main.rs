@@ -17,15 +17,7 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use std::{
-    cell::UnsafeCell,
-    collections::{HashMap, VecDeque},
-    convert::TryFrom,
-    future::Future,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc};
 
 use libtea::Message;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -55,7 +47,7 @@ async fn main2() {
         println!("/help to command list.");
         println!("Input index of friend or command.");
         let mut temp: usize = 0;
-        let mut data = session.get_users().await;
+        let data = session.get_users().await;
         for i in &data {
             match &*i.get_username().await {
                 Some(s) => println!("{}. {}", temp, s),
@@ -105,7 +97,7 @@ async fn chat_session(
     user: Arc<libtea::UserData>,
     receiver: &mut tokio::sync::mpsc::Receiver<Message>,
 ) {
-    let mut receiver = unsafe {
+    let receiver = unsafe {
         std::mem::transmute::<
             &mut tokio::sync::mpsc::Receiver<Message>,
             &mut tokio::sync::mpsc::Receiver<Message>,
@@ -141,6 +133,7 @@ async fn chat_session(
         } else if input.starts_with("/add") || input.starts_with("/del") {
             println!("Can't use this command now.");
         } else if input.starts_with("/exit") {
+            handle.abort();
             return;
         } else {
             session.send_msg(&user2.id, input).await;

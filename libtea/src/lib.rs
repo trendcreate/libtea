@@ -386,7 +386,6 @@ impl<'a> RYOKUCHATSession<'a> {
         }
 
         let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(self) };
-        let id = userdata.id.clone();
         let (mut read, write) = tokio::io::split(BufStream::new(stream));
         let userdata2 = Arc::clone(&userdata);
         *userdata.send.lock().await = Some(Box::new(write));
@@ -508,10 +507,7 @@ async fn process_message2<
                         };
                         // stub: メッセージ履歴の保存を実装
                         let mut number_to_data = session.number_to_data.write().await;
-                        let index = number_to_data
-                            .iter()
-                            .position(|r| &r.id == &user.id)
-                            .unwrap();
+                        let index = number_to_data.iter().position(|r| r.id == user.id).unwrap();
                         let data = number_to_data.remove(index).unwrap();
                         number_to_data.push_front(data);
                         drop(number_to_data);
