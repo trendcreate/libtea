@@ -202,6 +202,7 @@ impl<'a> RYOKUCHATSession<'a> {
                         };
                         // 連絡先リストに相手のアドレスがあることを確認
                         if let Some(s) = session.userid_to_data.write().await.get(&key) {
+                            let userdata = Arc::clone(s);
                             if s.id
                                 .verify(&buf[57..57 + 8], &buf[57 + 8..57 + 8 + 114], None)
                                 .is_ok()
@@ -211,7 +212,13 @@ impl<'a> RYOKUCHATSession<'a> {
                                 *s.handle.lock().await =
                                     Some(HandleWrapper(tokio::spawn(async move {
                                         loop {
-                                            match process_message(session, &key, &mut read).await {
+                                            match process_message(
+                                                session,
+                                                Arc::clone(&userdata),
+                                                &mut read,
+                                            )
+                                            .await
+                                            {
                                                 Some(_) => continue,
                                                 None => return,
                                             }
@@ -312,20 +319,15 @@ impl<'a> RYOKUCHATSession<'a> {
             let handle = s.handle.lock().await;
             if handle.is_none() {
                 drop(handle);
-                self.new_connection(&*s).await?;
+                self.new_connection(Arc::clone(&s)).await?;
             }
 
             if let Some(stream) = &mut *s.send.lock().await {
-                if stream.write_all(&len.to_be_bytes()).await.is_err() {
-                    return None;
-                }
-                if stream.write_all(&0_u16.to_be_bytes()).await.is_err() {
-                    return None;
-                }
-                if stream.write_all(msg.as_bytes()).await.is_err() {
-                    return None;
-                }
-                if stream.flush().await.is_err() {
+                let a = stream.write_all(&len.to_be_bytes()).await.is_err();
+                let b = stream.write_all(&0_u16.to_be_bytes()).await.is_err();
+                let c = stream.write_all(msg.as_bytes()).await.is_err();
+                let d = stream.flush().await.is_err();
+                if a && b && c && d {
                     return None;
                 }
             }
@@ -334,7 +336,7 @@ impl<'a> RYOKUCHATSession<'a> {
         None
     }
 
-    async fn new_connection(&self, userdata: &UserData) -> Option<()> {
+    async fn new_connection(&self, userdata: Arc<UserData>) -> Option<()> {
         let mut stream = match tokio_socks::tcp::Socks5Stream::connect(
             format!("[::1]:{}", self.socks_port).as_str(),
             format!("{}:4545", userdata.hostname),
@@ -377,10 +379,11 @@ impl<'a> RYOKUCHATSession<'a> {
         let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(self) };
         let id = userdata.id.clone();
         let (mut read, write) = tokio::io::split(BufStream::new(stream));
+        let userdata2 = Arc::clone(&userdata);
         *userdata.send.lock().await = Some(Box::new(write));
         *userdata.handle.lock().await = Some(HandleWrapper(tokio::spawn(async move {
             loop {
-                match process_message(session, &id, &mut read).await {
+                match process_message(session, Arc::clone(&userdata2), &mut read).await {
                     Some(_) => continue,
                     None => return,
                 }
@@ -443,12 +446,27 @@ impl std::ops::Drop for HandleWrapper {
     }
 }
 
-#[allow(clippy::collapsible_match, clippy::single_match)]
 async fn process_message<
     T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
     session: &RYOKUCHATSession<'_>,
-    userid: &PublicKey,
+    user: Arc<UserData>,
+    read: &mut T,
+) -> Option<()> {
+    let a = process_message2(session, Arc::clone(&user), read).await;
+    if a.is_none() {
+        *user.send.lock().await = None;
+        *user.handle.lock().await = None;
+    }
+    a
+}
+
+#[allow(clippy::collapsible_match, clippy::single_match)]
+async fn process_message2<
+    T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
+>(
+    session: &RYOKUCHATSession<'_>,
+    user: Arc<UserData>,
     read: &mut T,
 ) -> Option<()> {
     // メッセージのサイズを受信
@@ -481,13 +499,16 @@ async fn process_message<
                         };
                         // stub: メッセージ履歴の保存を実装
                         let mut number_to_data = session.number_to_data.write().await;
-                        let index = number_to_data.iter().position(|r| &r.id == userid).unwrap();
+                        let index = number_to_data
+                            .iter()
+                            .position(|r| &r.id == &user.id)
+                            .unwrap();
                         let data = number_to_data.remove(index).unwrap();
                         number_to_data.push_front(data);
                         drop(number_to_data);
                         match &mut *session.notify.lock().await {
                             Some(s) => {
-                                let userid = userid.clone();
+                                let userid = user.id.clone();
                                 let _ = s.send(Message::NewMsg(userid, msg.to_string())).await;
                             }
                             None => (),
