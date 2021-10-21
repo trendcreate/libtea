@@ -57,6 +57,12 @@ impl<'a> RYOKUCHATSession<'a> {
         // ディレクトリを作成
         data_dir.push("tor");
         let _ = fs::create_dir_all(&data_dir).await;
+        data_dir.push("torrc");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&data_dir);
+        data_dir.pop();
         data_dir.pop();
 
         #[cfg(not(target_os = "windows"))]
@@ -73,8 +79,11 @@ impl<'a> RYOKUCHATSession<'a> {
         // Torを起動
         let data_dir2 = data_dir.clone();
         data_dir.push("tor");
+        let mut data_dir3 = data_dir.clone();
+        data_dir3.push("torrc");
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
+                .flag(TorFlag::ConfigFile(data_dir3.to_str().unwrap().to_string()))
                 .flag(TorFlag::Quiet())
                 .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
                 .flag(TorFlag::SocksPortAddress(
