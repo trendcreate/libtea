@@ -13,12 +13,14 @@ use ed448_rust::{PrivateKey, PublicKey};
 use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream},
+    net::TcpListener,
     process::Command,
     sync::{mpsc::Sender, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     task::JoinHandle,
 };
+
+use rand::Rng;
 
 /// libteaのセッションです  
 /// newメソッドを使うことで生成できます  
@@ -27,6 +29,7 @@ use tokio::{
 pub struct RYOKUCHATSession<'a> {
     handles: Vec<HandleWrapper>,
     myprivkey: PrivateKey,
+    socks_port: u16,
     number_to_data: RwLock<VecDeque<Arc<UserData>>>,
     userid_to_data: RwLock<HashMap<&'a PublicKey, Arc<UserData>>>,
     pub notify: Mutex<Option<Sender<Message>>>,
@@ -34,8 +37,8 @@ pub struct RYOKUCHATSession<'a> {
 }
 
 /// メッセージの最大の長さです  
-/// 125000バイトからヘッダーの187バイトを引いたものです  
-pub const MAXMSGLEN: usize = 125000 - 57 - 8 - 114 - 8;
+/// 125000バイトからヘッダーの2バイトを足したものです  
+pub const MAXMSGLEN: usize = 125000 + 2;
 
 impl<'a> RYOKUCHATSession<'a> {
     /// 動作の説明:  
@@ -110,19 +113,19 @@ impl<'a> RYOKUCHATSession<'a> {
         data_dir.pop();
 
         // 連絡先リストを読み出す
-        let mut addressbook = String::new();
-        data_dir.push("AddressBook.ron");
+        let mut addressbook = Vec::new();
+        data_dir.push("AddressBook.bin");
         try_open_read(&data_dir, |mut f| async move {
-            f.write_all(ron::to_string(&UserDatas(Vec::new()))?.as_bytes())
+            f.write_all(&bincode::serialize(&UserDatas(Vec::new()))?)
                 .await?;
             Ok(())
         })
         .await
         .unwrap()
-        .read_to_string(&mut addressbook)
+        .read_to_end(&mut addressbook)
         .await
         .unwrap();
-        let addressbook: VecDeque<Arc<UserData>> = ron::from_str::<UserDatas>(&addressbook)
+        let addressbook: VecDeque<Arc<UserData>> = bincode::deserialize::<UserDatas>(&addressbook)
             .unwrap()
             .0
             .into_iter()
@@ -168,6 +171,7 @@ impl<'a> RYOKUCHATSession<'a> {
         let mut session = Box::new(RYOKUCHATSession {
             handles: vec![HandleWrapper(torhandle)],
             myprivkey: secretkey,
+            socks_port,
             number_to_data: RwLock::const_new(addressbook),
             userid_to_data: RwLock::const_new(userid_to_data),
             notify: Mutex::const_new(None),
@@ -203,7 +207,7 @@ impl<'a> RYOKUCHATSession<'a> {
                                 .is_ok()
                             {
                                 let (mut read, write) = tokio::io::split(stream);
-                                *s.send.lock().await = Some(write);
+                                *s.send.lock().await = Some(Box::new(write));
                                 *s.handle.lock().await =
                                     Some(HandleWrapper(tokio::spawn(async move {
                                         loop {
@@ -246,7 +250,15 @@ impl<'a> RYOKUCHATSession<'a> {
         self.number_to_data.read().await.clone()
     }
 
-    pub async fn get_user_from_id(id: &PublicKey) {}
+    /// 動作の説明:  
+    /// IDからユーザー情報を取得します  
+    /// 引数について:  
+    /// IDを指定します  
+    /// 返り値について:  
+    /// Arcで包まれたユーザー情報が返ってきます  
+    pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<Arc<UserData>> {
+        self.userid_to_data.read().await.get(id).map(Arc::clone)
+    }
 
     /// 動作の説明:  
     /// 連絡先リストにユーザーを追加します  
@@ -277,13 +289,104 @@ impl<'a> RYOKUCHATSession<'a> {
 
     /// 動作の説明:  
     /// 連絡先リストからユーザーを削除します  
-    ///
     pub async fn del_user(
         &self,
         index: usize,
         data: &mut RwLockWriteGuard<'a, VecDeque<Arc<UserData>>>,
     ) {
-        data.remove(index);
+        if let Some(s) = data.remove(index) {
+            self.userid_to_data.write().await.remove(&s.id);
+        }
+    }
+
+    /// 動作の説明:  
+    /// メッセージを送信します  
+    pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
+        let mut len: u64 = match TryFrom::try_from(msg.len()) {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+        len += 2;
+
+        if let Some(s) = self.get_user_from_id(id).await {
+            let handle = s.handle.lock().await;
+            if handle.is_none() {
+                drop(handle);
+                self.new_connection(&*s).await?;
+            }
+
+            if let Some(stream) = &mut *s.send.lock().await {
+                if stream.write_all(&len.to_be_bytes()).await.is_err() {
+                    return None;
+                }
+                if stream.write_all(&0_u16.to_be_bytes()).await.is_err() {
+                    return None;
+                }
+                if stream.write_all(msg.as_bytes()).await.is_err() {
+                    return None;
+                }
+                if stream.flush().await.is_err() {
+                    return None;
+                }
+            }
+            return Some(());
+        }
+        None
+    }
+
+    async fn new_connection(&self, userdata: &UserData) -> Option<()> {
+        let mut stream = match tokio_socks::tcp::Socks5Stream::connect(
+            format!("[::1]:{}", self.socks_port).as_str(),
+            format!("{}:4545", userdata.hostname),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+
+        // 57バイトの公開鍵(ID)を送信
+        let pubkey = match PublicKey::try_from(&self.myprivkey) {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+        match pubkey.as_bytes() {
+            Some(s) => {
+                if stream.write_all(&s).await.is_err() {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+
+        // 8バイトの検証用メッセージを送信
+        let random = rand::rngs::OsRng.gen::<u64>().to_be_bytes();
+        if stream.write_all(&random).await.is_err() {
+            return None;
+        }
+
+        // 114バイトの署名を送信
+        let sign = match self.myprivkey.sign(&random, None) {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+        if stream.write_all(&sign).await.is_err() {
+            return None;
+        }
+
+        let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(self) };
+        let id = userdata.id.clone();
+        let (mut read, write) = tokio::io::split(BufStream::new(stream));
+        *userdata.send.lock().await = Some(Box::new(write));
+        *userdata.handle.lock().await = Some(HandleWrapper(tokio::spawn(async move {
+            loop {
+                match process_message(session, &id, &mut read).await {
+                    Some(_) => continue,
+                    None => return,
+                }
+            }
+        })));
+        Some(())
     }
 }
 
@@ -294,7 +397,9 @@ pub struct UserData {
     hostname: String,
     // stub: ユーザーネームを取得できるようにする
     username: RwLock<Option<String>>,
-    send: Mutex<Option<WriteHalf<BufStream<TcpStream>>>>,
+    send: Mutex<
+        Option<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
+    >,
     handle: Mutex<Option<HandleWrapper>>,
 }
 
@@ -313,6 +418,7 @@ impl UserData {
     pub async fn get_address(&self) -> String {
         let mut address =
             base64::encode_config(self.id.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
+        address.push('@');
         address.push_str(&self.hostname);
         address
     }
@@ -338,10 +444,12 @@ impl std::ops::Drop for HandleWrapper {
 }
 
 #[allow(clippy::collapsible_match, clippy::single_match)]
-async fn process_message(
+async fn process_message<
+    T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
+>(
     session: &RYOKUCHATSession<'_>,
     userid: &PublicKey,
-    read: &mut ReadHalf<BufStream<TcpStream>>,
+    read: &mut T,
 ) -> Option<()> {
     // メッセージのサイズを受信
     let mut len = [0; 8];

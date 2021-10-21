@@ -17,212 +17,174 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-// use std::{
-//     cell::UnsafeCell,
-//     collections::{HashMap, VecDeque},
-//     convert::TryFrom,
-//     future::Future,
-//     ops::{Deref, DerefMut},
-//     sync::Arc,
-//     time::Duration,
-// };
+use std::{
+    cell::UnsafeCell,
+    collections::{HashMap, VecDeque},
+    convert::TryFrom,
+    future::Future,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+    time::Duration,
+};
 
-// struct SessionData<'a>(UnsafeCell<Option<SessionDataSome<'a>>>, UnsafeCell<bool>);
+use libtea::Message;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-// impl<'a> Deref for SessionData<'a> {
-//     type Target = SessionDataSome<'a>;
+#[tokio::main]
+async fn main() {
+    println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
+    println!("This program comes with ABSOLUTELY NO WARRANTY; for details watch lines 589-619 of the LICENSE file.");
+    println!("This is free software, and you are welcome to redistribute it");
+    println!("under certain conditions; watch lines 195-341 of the LICENSE file for details.");
+    println!();
 
-//     fn deref(&self) -> &Self::Target {
-//         unsafe {
-//             match &*self.0.get() {
-//                 Some(s) => s,
-//                 None => std::hint::unreachable_unchecked(),
-//             }
-//         }
-//     }
-// }
+    main2().await;
+    std::process::exit(0);
+}
 
-// #[allow(clippy::mut_from_ref)]
-// impl<'a> SessionData<'a> {
-//     unsafe fn set(&'a self) -> &'a mut Option<SessionDataSome> {
-//         if *self.1.get() {
-//             panic!("errorcode: 1");
-//         } else {
-//             *self.1.get() = true;
-//             &mut *(self.0.get())
-//         }
-//     }
-// }
+async fn main2() {
+    let mut data_dir = dirs::home_dir().unwrap();
+    data_dir.push(".config");
+    data_dir.push("RYOKUCHAT");
+    let session = libtea::RYOKUCHATSession::new(data_dir, 4546, 4545).await;
+    let (send, mut receive) = tokio::sync::mpsc::channel(1);
+    *session.notify.lock().await = Some(send);
 
-// unsafe impl<'a> std::marker::Sync for SessionData<'a> {}
-// unsafe impl<'a> std::marker::Send for SessionData<'a> {}
+    loop {
+        println!("Your address is: {}", &session.myaddress);
+        println!("/help to command list.");
+        println!("Input index of friend or command.");
+        let mut temp: usize = 0;
+        let mut data = session.get_users().await;
+        for i in &data {
+            match &*i.get_username().await {
+                Some(s) => println!("{}. {}", temp, s),
+                None => println!("{}. no_name ({})", temp, i.get_address().await),
+            }
+            temp += 1;
+        }
 
-// static DATA: SessionData = SessionData(UnsafeCell::new(None), UnsafeCell::new(false));
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all("MAINMENU> ".as_bytes()).await.unwrap();
+        stdout.flush().await.unwrap();
+        drop(stdout);
 
-// #[tokio::main]
-// async fn main() -> std::io::Result<()> {
-//     println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
-//     println!("This program comes with ABSOLUTELY NO WARRANTY; for details watch lines 589-619 of the LICENSE file.");
-//     println!("This is free software, and you are welcome to redistribute it");
-//     println!("under certain conditions; watch lines 195-341 of the LICENSE file for details.");
-//     println!();
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut input = String::new();
+        stdin.read_line(&mut input).await.unwrap();
+        let input = input.trim();
 
-//     let session = libtea::RYOKUCHATSession::new(dirs::home_dir().unwrap(), 4546, 4545).await;
+        let mut command_ok = None;
+        if input.starts_with("/help") {
+            help().await;
+        } else if input.starts_with("/add") {
+            command_ok = Some(add(&session, input).await);
+        } else if input.starts_with("/del") {
+            command_ok = Some(del(&session, &data, input).await);
+        } else if input.starts_with("/exit") {
+            return;
+        } else {
+            let index: usize = match input.parse() {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            chat_session(&session, Arc::clone(&data[index]), &mut receive).await;
+        }
+        if let Some(s) = command_ok {
+            match s {
+                true => println!("Command Successful!"),
+                false => println!("Command failed."),
+            }
+        }
+        println!();
+    }
+}
 
-//     Ok(())
-// }
+async fn chat_session(
+    session: &libtea::RYOKUCHATSession<'_>,
+    user: Arc<libtea::UserData>,
+    receiver: &mut tokio::sync::mpsc::Receiver<Message>,
+) {
+    let mut receiver = unsafe {
+        std::mem::transmute::<
+            &mut tokio::sync::mpsc::Receiver<Message>,
+            &mut tokio::sync::mpsc::Receiver<Message>,
+        >(receiver)
+    };
+    let user2 = Arc::clone(&user);
+    let handle = tokio::spawn(async move {
+        loop {
+            let newmsg = match receiver.recv().await {
+                Some(Message::NewMsg(a, b)) => {
+                    if a == user.id {
+                        b
+                    } else {
+                        continue;
+                    }
+                }
+                None => continue,
+            };
+            println!("> {}", newmsg);
+        }
+    });
+    loop {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all("CHAT> ".as_bytes()).await.unwrap();
+        stdout.flush().await.unwrap();
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut input = String::new();
+        stdin.read_line(&mut input).await.unwrap();
+        let input = input.trim();
 
-// async fn mainmenu() -> ! {
-//     let listen = TcpListener::bind("[::1]:4545").await.unwrap();
-//     tokio::spawn(async move {
-//         loop {
-//             let _ = match listen.accept().await {
-//                 Ok((o, _)) => tokio::spawn(async move {
-//                     let stream = BufStream::new(o);
-//                 }),
-//                 Err(_) => continue,
-//             };
-//         }
-//     });
-//     let mut stdin = BufReader::new(tokio::io::stdin());
-//     let mut input = String::new();
-//     loop {
-//         println!("Your address is: {}", &DATA.myaddress);
-//         println!("/help to command list.");
-//         println!("Input index of friend or command.");
-//         let mut temp: usize = 0;
-//         let mut data = DATA.number_to_data.write().await;
-//         for i in &*data {
-//             match &*i.username.read().await {
-//                 Some(s) => println!("{}. {}", temp, s),
-//                 None => println!("no_name ({})", i.hostname),
-//             }
-//             temp += 1;
-//         }
+        if input.starts_with("/help") {
+            help().await;
+        } else if input.starts_with("/add") || input.starts_with("/del") {
+            println!("Can't use this command now.");
+        } else if input.starts_with("/exit") {
+            return;
+        } else {
+            session.send_msg(&user2.id, input).await;
+        }
+    }
+}
 
-//         let mut stdout = tokio::io::stdout();
-//         stdout.write_all("RYOKUCHAT> ".as_bytes()).await.unwrap();
-//         stdout.flush().await.unwrap();
-//         drop(stdout);
+async fn help() {
+    println!("/help: Display this message\n/add (address): Add friend to your addressbook.\n/del (index): Delete friend from your addressbook.\n/exit: Exit from this screen.")
+}
 
-//         stdin.read_line(&mut input).await.unwrap();
-//         match command_execute(&input).await {
-//             Some(s) => {
-//                 let _ = s.await;
-//             }
-//             None => {}
-//         }
-//         println!();
-//     }
-//     // loop {
-//     //     match tokio_socks::tcp::Socks5Stream::connect(
-//     //         "[::1]:4546",
-//     //         "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion:80",
-//     //     )
-//     //     .await
-//     //     {
-//     //         Ok(_) => {
-//     //             println!("接続成功!");
-//     //             break;
-//     //         }
-//     //         Err(e) => {
-//     //             eprintln!("{}", e);
-//     //             tokio::time::sleep(Duration::from_secs(1)).await;
-//     //         }
-//     //     }
-//     // }
-// }
+async fn add(session: &libtea::RYOKUCHATSession<'_>, input: &str) -> bool {
+    let mut hoge = input.split(' ');
+    let _ = hoge.next();
+    let address = match hoge.next() {
+        Some(s) => s,
+        None => return false,
+    };
 
-// #[allow(clippy::manual_strip)]
-// async fn command_execute(
-//     command: &str,
-// ) -> Option<std::pin::Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>>>>> {
-//     let command = command.trim();
-//     if command.starts_with('/') {
-//         if command.len() > 1 {
-//             let mut command = command[1..].split(' ');
-//             match command.next().unwrap() {
-//                 "add" => {
-//                     let arg = match command.next() {
-//                         Some(s) => s,
-//                         None => {
-//                             println!("Requires an argument.");
-//                             return None;
-//                         }
-//                     }
-//                     .to_string();
-//                     Some(Box::pin(async move {
-//                         if let Some(s) = decode_address(&arg) {
-//                             let s = Arc::new(s);
-//                             DATA.number_to_data.write().await.push_front(Arc::clone(&s));
-//                             unsafe {
-//                                 DATA.address_to_data.write().await.insert(
-//                                     std::mem::transmute::<&PublicKey, &PublicKey>(&s.key),
-//                                     Arc::clone(&s),
-//                                 );
-//                             }
-//                             println!("Command succeeded.");
-//                         } else {
-//                             println!("Wrong argument format.");
-//                         }
-//                         Ok(())
-//                     }))
-//                 }
-//                 _ => None,
-//             }
-//         } else {
-//             None
-//         }
-//     } else {
-//         None
-//     }
-// }
+    session.add_user(address).await.is_some()
+}
 
-// fn decode_address(address: &str) -> Option<UserData> {
-//     let mut address = address.split('@');
-//     Some(UserData {
-//         key: match ed448_rust::PublicKey::try_from(
-//             match base64::decode_config(
-//                 match address.next() {
-//                     Some(s) => s,
-//                     None => return None,
-//                 },
-//                 base64::URL_SAFE_NO_PAD,
-//             ) {
-//                 Ok(o) => o,
-//                 Err(_) => return None,
-//             }
-//             .as_slice(),
-//         ) {
-//             Ok(o) => o,
-//             Err(_) => return None,
-//         },
-//         hostname: match address.next() {
-//             Some(s) => s.to_string(),
-//             None => return None,
-//         },
-//         username: RwLock::const_new(None),
-//     })
-// }
+async fn del<'a>(
+    session: &'a libtea::RYOKUCHATSession<'a>,
+    data: &VecDeque<Arc<libtea::UserData>>,
+    input: &str,
+) -> bool {
+    let mut hoge = input.split(' ');
+    let _ = hoge.next();
+    let index: usize = match hoge.next() {
+        Some(s) => match s.parse() {
+            Ok(o) => o,
+            Err(_) => return false,
+        },
+        None => return false,
+    };
 
-// async fn try_open_read<
-//     F: Fn(fs::File) -> R,
-//     R: Future<Output = Result<(), Box<dyn std::error::Error>>>,
-// >(
-//     path: &std::path::Path,
-//     initfn: F,
-// ) -> Result<fs::File, Box<dyn std::error::Error>> {
-//     match fs::File::open(&path).await {
-//         Ok(o) => Ok(o),
-//         Err(_) => match fs::File::create(&path).await {
-//             Ok(o) => {
-//                 initfn(o).await?;
-//                 Ok(fs::File::open(&path).await?)
-//             }
-//             Err(_) => panic!("Could not open and create {:?}", path),
-//         },
-//     }
-// }
-fn main() {
-    println!("hello world!");
+    let user = &data[index];
+    let mut users = session.get_users_and_lock().await;
+    let index = match users.iter().position(|a| a.id == user.id) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    session.del_user(index, &mut users).await;
+    true
 }
