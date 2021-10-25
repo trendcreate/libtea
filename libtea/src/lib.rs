@@ -56,7 +56,9 @@ impl<'a> RYOKUCHATSession<'a> {
     ) -> Box<RYOKUCHATSession<'a>> {
         // ディレクトリを作成
         data_dir.push("tor");
+        data_dir.push("hidden");
         let _ = fs::create_dir_all(&data_dir).await;
+        data_dir.pop();
         data_dir.push("torrc");
         let _ = std::fs::OpenOptions::new()
             .create(true)
@@ -77,13 +79,29 @@ impl<'a> RYOKUCHATSession<'a> {
             .unwrap();
 
         // Torを起動
-        let data_dir2 = data_dir.clone();
-        data_dir.push("tor");
-        let mut data_dir3 = data_dir.clone();
-        data_dir3.push("torrc");
+        let mut tor_dir = data_dir.clone();
+        tor_dir.push("tor");
+        let mut hidden_dir = tor_dir.clone();
+        hidden_dir.push("hidden");
+        let mut tor_config = tor_dir.clone();
+        tor_config.push("torrc");
+
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
-                .flag(TorFlag::ConfigFile(data_dir3.to_str().unwrap().to_string()))
+                .flag(TorFlag::DataDirectory(
+                    tor_dir.to_str().unwrap().to_string(),
+                ))
+                .flag(TorFlag::ConfigFile(
+                    tor_config.to_str().unwrap().to_string(),
+                ))
+                .flag(TorFlag::HiddenServiceDir(
+                    hidden_dir.to_str().unwrap().to_string(),
+                ))
+                .flag(TorFlag::HiddenServiceVersion(HiddenServiceVersion::V3))
+                .flag(TorFlag::HiddenServicePort(
+                    TorAddress::Port(4545),
+                    Some(TorAddress::AddressPort("[::1]".to_string(), ryokuchat_port)).into(),
+                ))
                 .flag(TorFlag::Quiet())
                 .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
                 .flag(TorFlag::SocksPortAddress(
@@ -91,18 +109,9 @@ impl<'a> RYOKUCHATSession<'a> {
                     None.into(),
                     None.into(),
                 ))
-                .flag(TorFlag::HiddenServiceDir(
-                    data_dir.to_str().unwrap().to_string(),
-                ))
-                .flag(TorFlag::HiddenServiceVersion(HiddenServiceVersion::V3))
-                .flag(TorFlag::HiddenServicePort(
-                    TorAddress::Port(4545),
-                    Some(TorAddress::AddressPort("[::1]".to_string(), ryokuchat_port)).into(),
-                ))
                 .start()
                 .unwrap();
         });
-        let mut data_dir = data_dir2;
 
         // 秘密鍵を読み出し､鍵のペアを用意する
         data_dir.push("DO_NOT_SEND_TO_OTHER_PEOPLE_secretkey.ykr");
@@ -125,7 +134,7 @@ impl<'a> RYOKUCHATSession<'a> {
         let mut addressbook = Vec::new();
         data_dir.push("AddressBook.bin");
         try_open_read(&data_dir, |mut f| async move {
-            f.write_all(&bincode::serialize(&UserDatas(Vec::new()))?)
+            f.write_all(&bincode::serialize(&UserDatasRaw(Vec::new()))?)
                 .await?;
             Ok(())
         })
@@ -134,16 +143,17 @@ impl<'a> RYOKUCHATSession<'a> {
         .read_to_end(&mut addressbook)
         .await
         .unwrap();
-        let addressbook: VecDeque<Arc<UserData>> = bincode::deserialize::<UserDatas>(&addressbook)
-            .unwrap()
-            .0
-            .into_iter()
-            .map(|a| {
-                let mut b = decode_address(&a.0).unwrap();
-                b.username = RwLock::const_new(a.1);
-                Arc::new(b)
-            })
-            .collect();
+        let addressbook: VecDeque<Arc<UserData>> =
+            bincode::deserialize::<UserDatasRaw>(&addressbook)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|a| {
+                    let mut b = decode_address(&a.address).unwrap();
+                    b.username = RwLock::const_new(a.name);
+                    Arc::new(b)
+                })
+                .collect();
         data_dir.pop();
 
         // ユーザーIDからそれに対応するデータを引けるHashMapを作る
@@ -160,6 +170,7 @@ impl<'a> RYOKUCHATSession<'a> {
 
         // 公開鍵とTorのホスト名から自分のアドレスを生成する
         data_dir.push("tor");
+        data_dir.push("hidden");
         data_dir.push("hostname");
         let mut address =
             base64::encode_config(publickey.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
@@ -318,10 +329,14 @@ impl<'a> RYOKUCHATSession<'a> {
     /// 動作の説明:  
     /// メッセージを送信します  
     pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
+        let msg = msg.trim();
         let mut len: u64 = match TryFrom::try_from(msg.len()) {
             Ok(o) => o,
             Err(_) => return None,
         };
+        if len == 0 {
+            return None;
+        }
         len += 2;
 
         if let Some(s) = self.get_user_from_id(id).await {
@@ -426,7 +441,7 @@ impl UserData {
     /// 動作の説明:  
     /// アドレスを取得します  
     /// アドレスのフォーマットは(ユーザーID)@(Tor Hidden Serviceのホスト名)です  
-    pub async fn get_address(&self) -> String {
+    pub fn get_address(&self) -> String {
         let mut address =
             base64::encode_config(self.id.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
         address.push('@');
@@ -444,7 +459,13 @@ pub enum Message {
 
 //以下非公開
 #[derive(serde::Serialize, serde::Deserialize)]
-struct UserDatas(Vec<(String, Option<String>)>);
+struct UserDatasRaw(Vec<UserDataRaw>);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UserDataRaw {
+    address: String,
+    name: Option<String>,
+}
 
 struct HandleWrapper(JoinHandle<()>);
 

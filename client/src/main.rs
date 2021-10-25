@@ -38,7 +38,41 @@ async fn main2() {
     let mut data_dir = dirs::home_dir().unwrap();
     data_dir.push(".config");
     data_dir.push("RYOKUCHAT");
-    let session = libtea::RYOKUCHATSession::new(data_dir, 4546, 4545).await;
+
+    println!("This client is developed debugging libtea.");
+    println!("Select debug mode:");
+    println!("1: As client 1");
+    println!("2: As client 2");
+
+    let socks_port;
+    let ryokuchat_port;
+    loop {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all("> ".as_bytes()).await.unwrap();
+        stdout.flush().await.unwrap();
+        drop(stdout);
+        let mut stdin = BufReader::new(tokio::io::stdin());
+        let mut input = String::new();
+        stdin.read_line(&mut input).await.unwrap();
+        let input = input.trim();
+
+        match input {
+            "1" => {
+                data_dir.push("client1");
+                socks_port = 4546;
+                ryokuchat_port = 4545;
+            }
+            "2" => {
+                data_dir.push("client2");
+                socks_port = 1920;
+                ryokuchat_port = 1919;
+            }
+            _ => continue,
+        }
+        break;
+    }
+
+    let session = libtea::RYOKUCHATSession::new(data_dir, socks_port, ryokuchat_port).await;
     let (send, mut receive) = tokio::sync::mpsc::channel(1);
     *session.notify.lock().await = Some(send);
 
@@ -51,7 +85,7 @@ async fn main2() {
         for i in &data {
             match &*i.get_username().await {
                 Some(s) => println!("{}. {}", temp, s),
-                None => println!("{}. no_name ({})", temp, i.get_address().await),
+                None => println!("{}. no_name ({})", temp, i.get_address()),
             }
             temp += 1;
         }
@@ -136,7 +170,9 @@ async fn chat_session(
             handle.abort();
             return;
         } else {
-            session.send_msg(&user2.id, input).await;
+            if session.send_msg(&user2.id, input).await.is_none() {
+                println!("Error while sending.");
+            }
         }
     }
 }
