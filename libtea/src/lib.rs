@@ -273,26 +273,24 @@ impl RYOKUCHATSession {
     pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<UserData> {
         let mut users = self.user_database.lock().await;
 
-        let user =
-            sqlx::query_as::<_, UserDataRaw>("SELECT id,hostname,username WHERE id=? FROM users;")
-                .bind(id.as_bytes().unwrap().as_slice())
-                .fetch_all(&mut *users)
-                .await;
+        let user = match sqlx::query_as::<_, UserDataRaw>(
+            "SELECT id,hostname,username WHERE id=? FROM users LIMIT 1;",
+        )
+        .bind(id.as_bytes().unwrap().as_slice())
+        .fetch_optional(&mut *users)
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
 
         match user {
-            Ok(o) => {
-                if o.len() == 1 {
-                    let user = &o[0];
-                    Some(UserData {
-                        id: PublicKey::try_from(user.id.as_slice()).unwrap(),
-                        hostname: user.hostname.clone(),
-                        username: user.username.clone(),
-                    })
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+            Some(s) => Some(UserData {
+                id: PublicKey::try_from(s.id.as_slice()).unwrap(),
+                hostname: s.hostname,
+                username: s.username,
+            }),
+            None => None,
         }
     }
 
@@ -312,13 +310,13 @@ impl RYOKUCHATSession {
 
         let mut users = self.user_database.lock().await;
 
-        match sqlx::query("SELECT id WHERE id=? FROM users;")
+        match sqlx::query("SELECT id WHERE id=? FROM users LIMIT 1;")
             .bind(user.id.as_slice())
-            .fetch_all(&mut *users)
+            .fetch_optional(&mut *users)
             .await
         {
             Ok(o) => {
-                if o.len() > 0 {
+                if o.is_none() {
                     return None;
                 }
             }
@@ -339,13 +337,15 @@ impl RYOKUCHATSession {
 
     /// 動作の説明:  
     /// 連絡先リストからユーザーを削除します  
-    pub async fn del_user<'a>(
-        &self,
-        index: usize,
-        data: &mut RwLockWriteGuard<'a, VecDeque<Arc<UserData>>>,
-    ) {
-        if let Some(s) = data.remove(index) {
-            self.userid_to_data.write().await.remove(&s.id);
+    pub async fn del_user(&self, id: &PublicKey) -> Option<()> {
+        let mut users = self.user_database.lock().await;
+        match sqlx::query("DELETE WHERE id=? FROM users LIMIT 1;")
+            .bind(id.as_bytes().unwrap().as_slice())
+            .execute(&mut *users)
+            .await
+        {
+            Ok(_) => Some(()),
+            Err(_) => None,
         }
     }
 
