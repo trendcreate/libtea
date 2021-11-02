@@ -1,3 +1,4 @@
+use core::slice::SlicePattern;
 use std::{
     collections::{HashMap, VecDeque},
     convert::TryFrom,
@@ -22,16 +23,17 @@ use tokio::{
 
 use rand::Rng;
 
+use sqlx::{Connection, Executor};
+
 /// libteaのセッションです  
 /// newメソッドを使うことで生成できます  
 /// notifyのMutexの中身を書き換えることで新規メッセージの通知を受け取ることができます  
 /// myaddressには自分のアドレスが入っており、共有することで他の人と通信することができます  
-pub struct RYOKUCHATSession<'a> {
+pub struct RYOKUCHATSession {
     handles: Vec<HandleWrapper>,
     myprivkey: PrivateKey,
     socks_port: u16,
-    number_to_data: RwLock<VecDeque<Arc<UserData>>>,
-    userid_to_data: RwLock<HashMap<&'a PublicKey, Arc<UserData>>>,
+    user_database: Mutex<sqlx::SqliteConnection>,
     pub notify: Mutex<Option<Sender<Message>>>,
     pub myaddress: String,
 }
@@ -40,7 +42,7 @@ pub struct RYOKUCHATSession<'a> {
 /// 125000バイトからヘッダーの2バイトを足したものです  
 pub const MAXMSGLEN: usize = 125000 + 2;
 
-impl<'a> RYOKUCHATSession<'a> {
+impl RYOKUCHATSession {
     /// 動作の説明:  
     /// 新しくRYOKUCHATSessionを作ります  
     /// 引数について:  
@@ -53,7 +55,7 @@ impl<'a> RYOKUCHATSession<'a> {
         mut data_dir: PathBuf,
         socks_port: u16,
         ryokuchat_port: u16,
-    ) -> Box<RYOKUCHATSession<'a>> {
+    ) -> Box<RYOKUCHATSession> {
         // ディレクトリを作成
         data_dir.push("tor");
         data_dir.push("hidden");
@@ -65,6 +67,21 @@ impl<'a> RYOKUCHATSession<'a> {
             .write(true)
             .open(&data_dir);
         data_dir.pop();
+        data_dir.pop();
+
+        // SQLiteの初期化
+        data_dir.push("sqlite.db");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&data_dir);
+        let mut sqlite = sqlx::SqliteConnection::connect(&format!("sqlite://{:?}", &data_dir))
+            .await
+            .unwrap();
+        sqlite
+            .execute("CREATE TABLE IF NOT EXISTS users (lastupdate INTEGER NOT NULL, id BLOB NOT NULL, hostname TEXT NOT NULL, username TEXT);")
+            .await
+            .unwrap();
         data_dir.pop();
 
         #[cfg(not(target_os = "windows"))]
@@ -130,44 +147,6 @@ impl<'a> RYOKUCHATSession<'a> {
         let publickey = PublicKey::try_from(&secretkey).unwrap();
         data_dir.pop();
 
-        // 連絡先リストを読み出す
-        let mut addressbook = Vec::new();
-        data_dir.push("AddressBook.bin");
-        try_open_read(&data_dir, |mut f| async move {
-            f.write_all(&bincode::serialize(&UserDatasRaw(Vec::new()))?)
-                .await?;
-            Ok(())
-        })
-        .await
-        .unwrap()
-        .read_to_end(&mut addressbook)
-        .await
-        .unwrap();
-        let addressbook: VecDeque<Arc<UserData>> =
-            bincode::deserialize::<UserDatasRaw>(&addressbook)
-                .unwrap()
-                .0
-                .into_iter()
-                .map(|a| {
-                    let mut b = decode_address(&a.address).unwrap();
-                    b.username = RwLock::const_new(a.name);
-                    Arc::new(b)
-                })
-                .collect();
-        data_dir.pop();
-
-        // ユーザーIDからそれに対応するデータを引けるHashMapを作る
-        let mut userid_to_data = HashMap::new();
-        for i in &addressbook {
-            // ライフタイムを騙しているが、addressbookの中のiはヒープ上にあり、addressbook自体もuserid_to_dataと一緒にRYOKUCHATSessionに格納されるため安全
-            unsafe {
-                userid_to_data.insert(
-                    std::mem::transmute::<&PublicKey, &PublicKey>(&i.id),
-                    Arc::clone(i),
-                );
-            }
-        }
-
         // 公開鍵とTorのホスト名から自分のアドレスを生成する
         data_dir.push("tor");
         data_dir.push("hidden");
@@ -192,8 +171,7 @@ impl<'a> RYOKUCHATSession<'a> {
             handles: vec![HandleWrapper(torhandle)],
             myprivkey: secretkey,
             socks_port,
-            number_to_data: RwLock::const_new(addressbook),
-            userid_to_data: RwLock::const_new(userid_to_data),
+            user_database: Mutex::const_new(sqlite),
             notify: Mutex::const_new(None),
             myaddress: address,
         });
@@ -257,24 +235,33 @@ impl<'a> RYOKUCHATSession<'a> {
     }
 
     /// 動作の説明:  
-    /// 連絡先リストをロックし取得します  
-    /// 返り値について:  
-    /// RwLockWriteGuardで包まれたVecDequeで連絡先が返ってきます  
-    /// 注意点:  
-    /// このメソッドで取得した連絡先はdropされない限り読み書き要求を永久にブロックし続けます  
-    /// パフォーマンスに影響するため、使い終わったらすぐにdrop()を使ってドロップしてください  
-    pub async fn get_users_and_lock(&'a self) -> RwLockWriteGuard<'a, VecDeque<Arc<UserData>>> {
-        self.number_to_data.write().await
-    }
-
-    /// 動作の説明:  
     /// 実行された時点での連絡先リストを取得します  
     /// 返り値について:  
     /// VecDequeでArcに包まれたUserDataが返ってきます  
     /// 注意点:  
-    /// get_users_and_lockのようにロックしたりはしませんが、内部の連絡先リストと同期はされないため自分で変更を適用してください  
-    pub async fn get_users(&self) -> VecDeque<Arc<UserData>> {
-        self.number_to_data.read().await.clone()
+    /// 内部の連絡先リストと同期はされないため自分で変更を適用してください  
+    pub async fn get_users(&self) -> Option<Vec<UserData>> {
+        // self.number_to_data.read().await.clone()
+        let mut users = self.user_database.lock().await;
+
+        let user = sqlx::query_as::<_, UserDataRaw>(
+            "SELECT id,hostname,username FROM users ORDER BY lastupdate DESC;",
+        )
+        .fetch_all(&mut *users)
+        .await;
+
+        match user {
+            Ok(o) => Some(
+                o.into_iter()
+                    .map(|u| UserData {
+                        id: PublicKey::try_from(u.id.as_slice()).unwrap(),
+                        hostname: u.hostname,
+                        username: u.username,
+                    })
+                    .collect(),
+            ),
+            Err(_) => None,
+        }
     }
 
     /// 動作の説明:  
@@ -283,8 +270,30 @@ impl<'a> RYOKUCHATSession<'a> {
     /// IDを指定します  
     /// 返り値について:  
     /// Arcで包まれたユーザー情報が返ってきます  
-    pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<Arc<UserData>> {
-        self.userid_to_data.read().await.get(id).map(Arc::clone)
+    pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<UserData> {
+        let mut users = self.user_database.lock().await;
+
+        let user =
+            sqlx::query_as::<_, UserDataRaw>("SELECT id,hostname,username WHERE id=? FROM users;")
+                .bind(id.as_bytes().unwrap().as_slice())
+                .fetch_all(&mut *users)
+                .await;
+
+        match user {
+            Ok(o) => {
+                if o.len() == 1 {
+                    let user = &o[0];
+                    Some(UserData {
+                        id: PublicKey::try_from(user.id.as_slice()).unwrap(),
+                        hostname: user.hostname.clone(),
+                        username: user.username.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
     }
 
     /// 動作の説明:  
@@ -296,27 +305,41 @@ impl<'a> RYOKUCHATSession<'a> {
     /// 返り値について:  
     /// 成功ならばSome(())、失敗ならばNoneが返ります  
     pub async fn add_user(&self, address: &str) -> Option<()> {
-        match decode_address(address) {
-            Some(s) => {
-                let s = Arc::new(s);
-                self.number_to_data.write().await.push_front(Arc::clone(&s));
+        let user = match decode_address(address) {
+            Some(s) => s,
+            None => return None,
+        };
 
-                // ライフタイムを騙しているが、sの実体はヒープ上にあり、sをcloneしたものはRYOKUCHATSessionが消えるまで存在し続けるため安全
-                unsafe {
-                    self.userid_to_data.write().await.insert(
-                        std::mem::transmute::<&PublicKey, &PublicKey>(&s.id),
-                        Arc::clone(&s),
-                    );
+        let mut users = self.user_database.lock().await;
+
+        match sqlx::query("SELECT id WHERE id=? FROM users;")
+            .bind(user.id.as_slice())
+            .fetch_all(&mut *users)
+            .await
+        {
+            Ok(o) => {
+                if o.len() > 0 {
+                    return None;
                 }
-                Some(())
             }
-            None => None,
+            Err(_) => return None,
+        }
+
+        match sqlx::query("INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);")
+            .bind(chrono::Local::now().timestamp())
+            .bind(user.id.as_slice())
+            .bind(user.hostname)
+            .execute(&mut *users)
+            .await
+        {
+            Ok(_) => Some(()),
+            Err(_) => None,
         }
     }
 
     /// 動作の説明:  
     /// 連絡先リストからユーザーを削除します  
-    pub async fn del_user(
+    pub async fn del_user<'a>(
         &self,
         index: usize,
         data: &mut RwLockWriteGuard<'a, VecDeque<Arc<UserData>>>,
@@ -417,16 +440,16 @@ impl<'a> RYOKUCHATSession<'a> {
 }
 
 /// 連絡先リストに含まれるユーザーのデータです
-/// idにはそのユーザーのIDが内部表現で入っています  
+/// idにはそのユーザーのIDが内部表現で入っています
 pub struct UserData {
     pub id: PublicKey,
     hostname: String,
     // stub: ユーザーネームを取得できるようにする
-    username: RwLock<Option<String>>,
-    send: Mutex<
-        Option<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
-    >,
-    handle: Mutex<Option<HandleWrapper>>,
+    username: Option<String>,
+    // send: Mutex<
+    //     Option<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
+    // >,
+    // handle: Mutex<Option<HandleWrapper>>,
 }
 
 impl UserData {
@@ -458,13 +481,11 @@ pub enum Message {
 }
 
 //以下非公開
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UserDatasRaw(Vec<UserDataRaw>);
-
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(sqlx::FromRow)]
 struct UserDataRaw {
-    address: String,
-    name: Option<String>,
+    id: Vec<u8>,
+    hostname: String,
+    username: Option<String>,
 }
 
 struct HandleWrapper(JoinHandle<()>);
@@ -478,7 +499,7 @@ impl std::ops::Drop for HandleWrapper {
 async fn process_message<
     T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
-    session: &RYOKUCHATSession<'_>,
+    session: &RYOKUCHATSession,
     user: Arc<UserData>,
     read: &mut T,
 ) -> Option<()> {
@@ -494,7 +515,7 @@ async fn process_message<
 async fn process_message2<
     T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
-    session: &RYOKUCHATSession<'_>,
+    session: &RYOKUCHATSession,
     user: Arc<UserData>,
     read: &mut T,
 ) -> Option<()> {
@@ -549,7 +570,7 @@ async fn process_message2<
     None
 }
 
-fn decode_address(address: &str) -> Option<UserData> {
+fn decode_address(address: &str) -> Option<UserDataRaw> {
     let mut address = address.split('@');
 
     let key = match address.next() {
@@ -560,22 +581,16 @@ fn decode_address(address: &str) -> Option<UserData> {
         Ok(o) => o,
         Err(_) => return None,
     };
-    let key = match ed448_rust::PublicKey::try_from(key.as_slice()) {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
 
     let hostname = match address.next() {
         Some(s) => s.to_string(),
         None => return None,
     };
 
-    Some(UserData {
+    Some(UserDataRaw {
         id: key,
         hostname,
-        username: RwLock::const_new(None),
-        send: Mutex::const_new(None),
-        handle: Mutex::const_new(None),
+        username: None,
     })
 }
 
