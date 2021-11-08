@@ -2,6 +2,7 @@
 RYOKUCHAT is a P2P chat application.
 
 Copyright (C) 2021 TrendCreate
+# Copyright (C) 2021 WinLinux1028
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
