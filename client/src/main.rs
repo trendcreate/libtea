@@ -2,7 +2,8 @@
 RYOKUCHAT is a P2P chat application.
 
 Copyright (C) 2021 TrendCreate
-# Copyright (C) 2021 WinLinux1028
+Copyright (C) 2021 WinLinux1028
+Copyright (C) 2021 TRENDcreate
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -26,6 +27,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[tokio::main]
 async fn main() {
     println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
+    println!("RYOKUCHAT Copyright (C) 2021 WinLinux1028");
+    println!("RYOKUCHAT Copyright (C) 2021 TRENDcreate");
     println!("This program comes with ABSOLUTELY NO WARRANTY; for details watch lines 589-619 of the LICENSE file.");
     println!("This is free software, and you are welcome to redistribute it");
     println!("under certain conditions; watch lines 195-341 of the LICENSE file for details.");
