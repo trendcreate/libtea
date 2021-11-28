@@ -1,11 +1,26 @@
-use core::slice::SlicePattern;
+/*
+RYOKUCHAT is a P2P chat application.
+
+Copyright (C) 2021 TrendCreate
+Copyright (C) 2021 WinLinux1028
+Copyright (C) 2021 TRENDcreate
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+*/
+
 use std::{
-    collections::{HashMap, VecDeque},
-    convert::TryFrom,
-    future::Future,
-    io::Cursor,
-    path::PathBuf,
-    sync::Arc,
+    collections::HashMap, convert::TryFrom, future::Future, io::Cursor, path::PathBuf,
     time::Duration,
 };
 
@@ -17,7 +32,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream},
     net::TcpListener,
     process::Command,
-    sync::{mpsc::Sender, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{mpsc::Sender, Mutex, RwLock},
     task::JoinHandle,
 };
 
@@ -34,6 +49,7 @@ pub struct RYOKUCHATSession {
     myprivkey: PrivateKey,
     socks_port: u16,
     user_database: Mutex<sqlx::SqliteConnection>,
+    user_data_temp: RwLock<HashMap<[u8; 57], UserDataTemp>>,
     pub notify: Mutex<Option<Sender<Message>>>,
     pub myaddress: String,
 }
@@ -75,9 +91,10 @@ impl RYOKUCHATSession {
             .create(true)
             .write(true)
             .open(&data_dir);
-        let mut sqlite = sqlx::SqliteConnection::connect(&format!("sqlite://{:?}", &data_dir))
-            .await
-            .unwrap();
+        let mut sqlite =
+            sqlx::SqliteConnection::connect(&format!("sqlite://{}", data_dir.to_str().unwrap()))
+                .await
+                .unwrap();
         sqlite
             .execute("CREATE TABLE IF NOT EXISTS users (lastupdate INTEGER NOT NULL, id BLOB NOT NULL, hostname TEXT NOT NULL, username TEXT);")
             .await
@@ -105,6 +122,7 @@ impl RYOKUCHATSession {
 
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
+                .flag(TorFlag::Quiet())
                 .flag(TorFlag::DataDirectory(
                     tor_dir.to_str().unwrap().to_string(),
                 ))
@@ -119,13 +137,17 @@ impl RYOKUCHATSession {
                     TorAddress::Port(4545),
                     Some(TorAddress::AddressPort("[::1]".to_string(), ryokuchat_port)).into(),
                 ))
-                .flag(TorFlag::Quiet())
-                .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
                 .flag(TorFlag::SocksPortAddress(
                     TorAddress::AddressPort("[::1]".to_string(), socks_port),
                     None.into(),
                     None.into(),
                 ))
+                .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
+                .flag(TorFlag::StrictNodes(true.into()))
+                .flag(TorFlag::ConnectionPadding(true.into()))
+                .flag(TorFlag::ReducedConnectionPadding(false.into()))
+                .flag(TorFlag::CircuitPadding(true.into()))
+                .flag(TorFlag::ReducedCircuitPadding(false.into()))
                 .start()
                 .unwrap();
         });
@@ -151,8 +173,7 @@ impl RYOKUCHATSession {
         data_dir.push("tor");
         data_dir.push("hidden");
         data_dir.push("hostname");
-        let mut address =
-            base64::encode_config(publickey.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
+        let mut address = base64::encode_config(publickey.as_byte(), base64::URL_SAFE_NO_PAD);
         address.push('@');
         let mut hostname = String::new();
         loop {
@@ -172,6 +193,7 @@ impl RYOKUCHATSession {
             myprivkey: secretkey,
             socks_port,
             user_database: Mutex::const_new(sqlite),
+            user_data_temp: RwLock::const_new(HashMap::new()),
             notify: Mutex::const_new(None),
             myaddress: address,
         });
@@ -199,31 +221,15 @@ impl RYOKUCHATSession {
                             Err(_) => return,
                         };
                         // 連絡先リストに相手のアドレスがあることを確認
-                        if let Some(s) = session.userid_to_data.write().await.get(&key) {
-                            let userdata = Arc::clone(s);
+
+                        if let Some(s) = session.get_user_from_id(&key).await {
                             if s.id
                                 .verify(&buf[57..57 + 8], &buf[57 + 8..57 + 8 + 114], None)
                                 .is_ok()
                             {
-                                let (mut read, write) = tokio::io::split(stream);
-                                *s.send.lock().await = Some(Box::new(write));
-                                *s.handle.lock().await =
-                                    Some(HandleWrapper(tokio::spawn(async move {
-                                        loop {
-                                            match process_message(
-                                                session,
-                                                Arc::clone(&userdata),
-                                                &mut read,
-                                            )
-                                            .await
-                                            {
-                                                Some(_) => continue,
-                                                None => return,
-                                            }
-                                        }
-                                    })));
+                                process_message(session, key, stream).await;
                             }
-                        };
+                        }
                     }),
                     Err(_) => continue,
                 };
@@ -269,14 +275,14 @@ impl RYOKUCHATSession {
     /// 引数について:  
     /// IDを指定します  
     /// 返り値について:  
-    /// Arcで包まれたユーザー情報が返ってきます  
+    /// データベースから取得したユーザー情報が返ってきます  
     pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<UserData> {
         let mut users = self.user_database.lock().await;
 
         let user = match sqlx::query_as::<_, UserDataRaw>(
-            "SELECT id,hostname,username WHERE id=? FROM users LIMIT 1;",
+            "SELECT id,hostname,username FROM users WHERE id=? LIMIT 1;",
         )
-        .bind(id.as_bytes().unwrap().as_slice())
+        .bind(id.as_byte().as_slice())
         .fetch_optional(&mut *users)
         .await
         {
@@ -310,27 +316,28 @@ impl RYOKUCHATSession {
 
         let mut users = self.user_database.lock().await;
 
-        match sqlx::query("SELECT id WHERE id=? FROM users LIMIT 1;")
+        match sqlx::query("SELECT id FROM users WHERE id=? LIMIT 1;")
             .bind(user.id.as_slice())
             .fetch_optional(&mut *users)
             .await
         {
             Ok(o) => {
                 if o.is_none() {
-                    return None;
+                    match sqlx::query(
+                        "INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);",
+                    )
+                    .bind(chrono::Local::now().timestamp())
+                    .bind(user.id.as_slice())
+                    .bind(user.hostname)
+                    .execute(&mut *users)
+                    .await
+                    {
+                        Ok(_) => return Some(()),
+                        Err(_) => return None,
+                    }
                 }
+                None
             }
-            Err(_) => return None,
-        }
-
-        match sqlx::query("INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);")
-            .bind(chrono::Local::now().timestamp())
-            .bind(user.id.as_slice())
-            .bind(user.hostname)
-            .execute(&mut *users)
-            .await
-        {
-            Ok(_) => Some(()),
             Err(_) => None,
         }
     }
@@ -339,8 +346,8 @@ impl RYOKUCHATSession {
     /// 連絡先リストからユーザーを削除します  
     pub async fn del_user(&self, id: &PublicKey) -> Option<()> {
         let mut users = self.user_database.lock().await;
-        match sqlx::query("DELETE WHERE id=? FROM users LIMIT 1;")
-            .bind(id.as_bytes().unwrap().as_slice())
+        match sqlx::query("DELETE FROM users WHERE id=?;")
+            .bind(id.as_byte().as_slice())
             .execute(&mut *users)
             .await
         {
@@ -362,28 +369,29 @@ impl RYOKUCHATSession {
         }
         len += 2;
 
-        if let Some(s) = self.get_user_from_id(id).await {
-            let handle = s.handle.lock().await;
-            if handle.is_none() {
-                drop(handle);
-                self.new_connection(Arc::clone(&s)).await?;
-            }
-
-            if let Some(stream) = &mut *s.send.lock().await {
-                let a = stream.write_all(&len.to_be_bytes()).await.is_err();
-                let b = stream.write_all(&0_u16.to_be_bytes()).await.is_err();
-                let c = stream.write_all(msg.as_bytes()).await.is_err();
-                let d = stream.flush().await.is_err();
-                if a && b && c && d {
-                    return None;
-                }
-            }
-            return Some(());
+        let user = match self.get_user_from_id(id).await {
+            Some(s) => s,
+            None => return None,
+        };
+        let user_data_temp = self.user_data_temp.read().await;
+        if user_data_temp.get(&id.as_byte()).is_none() {
+            drop(user_data_temp);
+            self.new_connection(user).await?;
+        } else {
+            drop(user_data_temp);
         }
-        None
+
+        let user_data_temp = self.user_data_temp.read().await;
+        let usertemp = unsafe { user_data_temp.get(&id.as_byte()).unwrap_unchecked() };
+        let mut send = usertemp.send.lock().await;
+        send.write_all(&len.to_be_bytes()).await.ok()?;
+        send.write_all(&0_u16.to_be_bytes()).await.ok()?;
+        send.write_all(msg.as_bytes()).await.ok()?;
+        send.flush().await.ok()?;
+        Some(())
     }
 
-    async fn new_connection(&self, userdata: Arc<UserData>) -> Option<()> {
+    async fn new_connection(&self, userdata: UserData) -> Option<()> {
         let mut stream = match tokio_socks::tcp::Socks5Stream::connect(
             format!("[::1]:{}", self.socks_port).as_str(),
             format!("{}:4545", userdata.hostname),
@@ -399,43 +407,35 @@ impl RYOKUCHATSession {
             Ok(o) => o,
             Err(_) => return None,
         };
-        match pubkey.as_bytes() {
-            Some(s) => {
-                if stream.write_all(&s).await.is_err() {
-                    return None;
-                }
-            }
-            None => return None,
-        }
+        stream.write_all(&pubkey.as_byte()).await.ok()?;
 
         // 8バイトの検証用メッセージを送信
         let random = rand::rngs::OsRng.gen::<u64>().to_be_bytes();
-        if stream.write_all(&random).await.is_err() {
-            return None;
-        }
+        stream.write_all(&random).await.ok()?;
 
         // 114バイトの署名を送信
         let sign = match self.myprivkey.sign(&random, None) {
             Ok(o) => o,
             Err(_) => return None,
         };
-        if stream.write_all(&sign).await.is_err() {
-            return None;
-        }
+        stream.write_all(&sign).await.ok()?;
+        stream.flush().await.ok()?;
 
-        let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(self) };
-        let (mut read, write) = tokio::io::split(BufStream::new(stream));
-        let userdata2 = Arc::clone(&userdata);
-        *userdata.send.lock().await = Some(Box::new(write));
-        *userdata.handle.lock().await = Some(HandleWrapper(tokio::spawn(async move {
-            loop {
-                match process_message(session, Arc::clone(&userdata2), &mut read).await {
-                    Some(_) => continue,
-                    None => return,
-                }
-            }
-        })));
+        process_message(self, userdata.id, stream).await;
         Some(())
+    }
+
+    async fn new_lastupdate(&self, id: &PublicKey) -> Option<()> {
+        let mut users = self.user_database.lock().await;
+        match sqlx::query("UPDATE users SET lastupdate=? WHERE id=? LIMIT 1;")
+            .bind(chrono::Local::now().timestamp())
+            .bind(id.as_byte().as_slice())
+            .execute(&mut *users)
+            .await
+        {
+            Ok(_) => Some(()),
+            Err(_) => None,
+        }
     }
 }
 
@@ -443,9 +443,9 @@ impl RYOKUCHATSession {
 /// idにはそのユーザーのIDが内部表現で入っています
 pub struct UserData {
     pub id: PublicKey,
-    hostname: String,
+    pub hostname: String,
     // stub: ユーザーネームを取得できるようにする
-    username: Option<String>,
+    pub username: Option<String>,
     // send: Mutex<
     //     Option<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
     // >,
@@ -454,19 +454,10 @@ pub struct UserData {
 
 impl UserData {
     /// 動作の説明:  
-    /// ユーザー名を取得します  
-    /// 注意点:  
-    /// ユーザー名の領域をロックするため、なるべく早くdrop()してください  
-    pub async fn get_username(&'_ self) -> RwLockReadGuard<'_, Option<String>> {
-        self.username.read().await
-    }
-
-    /// 動作の説明:  
     /// アドレスを取得します  
     /// アドレスのフォーマットは(ユーザーID)@(Tor Hidden Serviceのホスト名)です  
     pub fn get_address(&self) -> String {
-        let mut address =
-            base64::encode_config(self.id.as_bytes().unwrap(), base64::URL_SAFE_NO_PAD);
+        let mut address = base64::encode_config(self.id.as_byte(), base64::URL_SAFE_NO_PAD);
         address.push('@');
         address.push_str(&self.hostname);
         address
@@ -477,7 +468,7 @@ impl UserData {
 pub enum Message {
     /// 新しい通常のメッセージが来た場合の情報を格納します  
     /// 1つ目にユーザーID、2つ目にメッセージが入ります  
-    NewMsg(PublicKey, String),
+    DirectMsg(PublicKey, String),
 }
 
 //以下非公開
@@ -486,6 +477,12 @@ struct UserDataRaw {
     id: Vec<u8>,
     hostname: String,
     username: Option<String>,
+}
+
+#[allow(dead_code)]
+struct UserDataTemp {
+    send: Mutex<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
+    handle: HandleWrapper,
 }
 
 struct HandleWrapper(JoinHandle<()>);
@@ -497,18 +494,33 @@ impl std::ops::Drop for HandleWrapper {
 }
 
 async fn process_message<
-    T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
+    T: 'static + AsyncRead + AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
     session: &RYOKUCHATSession,
-    user: Arc<UserData>,
-    read: &mut T,
-) -> Option<()> {
-    let a = process_message2(session, Arc::clone(&user), read).await;
-    if a.is_none() {
-        *user.send.lock().await = None;
-        *user.handle.lock().await = None;
-    }
-    a
+    userid: PublicKey,
+    stream: T,
+) {
+    let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(session) };
+    let (mut read, write) = tokio::io::split(BufStream::new(stream));
+    session.user_data_temp.write().await.insert(
+        userid.as_byte(),
+        UserDataTemp {
+            send: Mutex::new(Box::new(write)),
+            handle: HandleWrapper(tokio::spawn(async move {
+                loop {
+                    let a = process_message2(session, &userid, &mut read).await;
+                    if a.is_none() {
+                        session
+                            .user_data_temp
+                            .write()
+                            .await
+                            .remove(&userid.as_byte());
+                        return;
+                    }
+                }
+            })),
+        },
+    );
 }
 
 #[allow(clippy::collapsible_match, clippy::single_match)]
@@ -516,7 +528,7 @@ async fn process_message2<
     T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
     session: &RYOKUCHATSession,
-    user: Arc<UserData>,
+    userid: &PublicKey,
     read: &mut T,
 ) -> Option<()> {
     // メッセージのサイズを受信
@@ -548,15 +560,12 @@ async fn process_message2<
                             Err(_) => return None,
                         };
                         // stub: メッセージ履歴の保存を実装
-                        let mut number_to_data = session.number_to_data.write().await;
-                        let index = number_to_data.iter().position(|r| r.id == user.id).unwrap();
-                        let data = number_to_data.remove(index).unwrap();
-                        number_to_data.push_front(data);
-                        drop(number_to_data);
+                        session.new_lastupdate(userid).await;
+
                         match &mut *session.notify.lock().await {
                             Some(s) => {
-                                let userid = user.id.clone();
-                                let _ = s.send(Message::NewMsg(userid, msg.to_string())).await;
+                                let userid = userid.clone();
+                                let _ = s.send(Message::DirectMsg(userid, msg.to_string())).await;
                             }
                             None => (),
                         }

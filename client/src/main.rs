@@ -85,9 +85,9 @@ async fn main2() {
         println!("/help to command list.");
         println!("Input index of friend or command.");
         let mut temp: usize = 0;
-        let data = session.get_users().await;
+        let data = session.get_users().await.unwrap();
         for i in &data {
-            match &*i.get_username().await {
+            match &i.username {
                 Some(s) => println!("{}. {}", temp, s),
                 None => println!("{}. no_name ({})", temp, i.get_address()),
             }
@@ -118,7 +118,7 @@ async fn main2() {
                 Ok(o) => o,
                 Err(_) => continue,
             };
-            chat_session(&session, Arc::clone(&data[index]), &mut receive).await;
+            chat_session(&session, &data[index], &mut receive).await;
         }
         if let Some(s) = command_ok {
             match s {
@@ -131,8 +131,8 @@ async fn main2() {
 }
 
 async fn chat_session(
-    session: &libtea::RYOKUCHATSession<'_>,
-    user: Arc<libtea::UserData>,
+    session: &libtea::RYOKUCHATSession,
+    user: &libtea::UserData,
     receiver: &mut tokio::sync::mpsc::Receiver<Message>,
 ) {
     let receiver = unsafe {
@@ -141,12 +141,12 @@ async fn chat_session(
             &mut tokio::sync::mpsc::Receiver<Message>,
         >(receiver)
     };
-    let user2 = Arc::clone(&user);
+    let user = unsafe { std::mem::transmute::<&libtea::UserData, &libtea::UserData>(user) };
     let handle = tokio::spawn(async move {
         loop {
             let newmsg = match receiver.recv().await {
-                Some(Message::NewMsg(a, b)) => {
-                    if a == user.id {
+                Some(Message::DirectMsg(a, b)) => {
+                    if a.as_byte() == user.id.as_byte() {
                         b
                     } else {
                         continue;
@@ -173,10 +173,9 @@ async fn chat_session(
         } else if input.starts_with("/exit") {
             handle.abort();
             return;
-        } else {
-            if session.send_msg(&user2.id, input).await.is_none() {
-                println!("Error while sending.");
-            }
+        }
+        if session.send_msg(&user.id, input).await.is_none() {
+            println!("Error while sending.");
         }
     }
 }
@@ -185,7 +184,7 @@ async fn help() {
     println!("/help: Display this message\n/add (address): Add friend to your addressbook.\n/del (index): Delete friend from your addressbook.\n/exit: Exit from this screen.")
 }
 
-async fn add(session: &libtea::RYOKUCHATSession<'_>, input: &str) -> bool {
+async fn add(session: &libtea::RYOKUCHATSession, input: &str) -> bool {
     let mut hoge = input.split(' ');
     let _ = hoge.next();
     let address = match hoge.next() {
@@ -196,9 +195,9 @@ async fn add(session: &libtea::RYOKUCHATSession<'_>, input: &str) -> bool {
     session.add_user(address).await.is_some()
 }
 
-async fn del<'a>(
-    session: &'a libtea::RYOKUCHATSession<'a>,
-    data: &VecDeque<Arc<libtea::UserData>>,
+async fn del(
+    session: &libtea::RYOKUCHATSession,
+    data: &Vec<libtea::UserData>,
     input: &str,
 ) -> bool {
     let mut hoge = input.split(' ');
@@ -212,12 +211,5 @@ async fn del<'a>(
     };
 
     let user = &data[index];
-    let mut users = session.get_users_and_lock().await;
-    let index = match users.iter().position(|a| a.id == user.id) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    session.del_user(index, &mut users).await;
-    true
+    session.del_user(&user.id).await.is_some()
 }
