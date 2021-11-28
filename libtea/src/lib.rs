@@ -55,7 +55,6 @@ pub struct RYOKUCHATSession {
 }
 
 /// メッセージの最大の長さです  
-/// 125000バイトからヘッダーの2バイトを足したものです  
 pub const MAXMSGLEN: usize = 125000 + 2;
 
 impl RYOKUCHATSession {
@@ -216,20 +215,20 @@ impl RYOKUCHATSession {
                         let key = PublicKey::try_from(&key).ok()?;
 
                         // 連絡先リストに相手のアドレスがあることを確認
-                        if let Some(s) = session.get_user_from_id(&key).await {
-                            // 16バイトの認証用メッセージ
-                            let auth = rand::rngs::OsRng.gen::<u128>().to_be_bytes();
-                            stream.write_all(&auth).await.ok()?;
-                            stream.flush().await.ok()?;
-                            let mut sign = [0; 114];
-                            stream.read_exact(&mut sign).await.ok()?;
-                            s.id.verify(&greeting_auth(&auth).unwrap(), &sign, None)
-                                .ok()?;
+                        let user = session.get_user_from_id(&key).await?;
 
-                            process_message(session, key, stream).await;
-                            return Some(());
-                        }
-                        None
+                        // 16バイトの認証用メッセージ
+                        let auth = rand::rngs::OsRng.gen::<u128>().to_be_bytes();
+                        stream.write_all(&auth).await.ok()?;
+                        stream.flush().await.ok()?;
+                        let mut sign = [0; 114];
+                        stream.read_exact(&mut sign).await.ok()?;
+                        user.id
+                            .verify(&greeting_auth(&auth).unwrap(), &sign, None)
+                            .ok()?;
+
+                        process_message(session, key, stream).await;
+                        Some(())
                     }),
                     Err(_) => continue,
                 };
@@ -242,10 +241,8 @@ impl RYOKUCHATSession {
 
     /// 動作の説明:  
     /// 実行された時点での連絡先リストを取得します  
-    /// 返り値について:  
-    /// VecDequeでArcに包まれたUserDataが返ってきます  
     /// 注意点:  
-    /// 内部の連絡先リストと同期はされないため自分で変更を適用してください  
+    /// 内部の連絡先リストと同期はされないため自分で変更を適用するか定期的に再取得してください  
     pub async fn get_users(&self) -> Option<Vec<UserData>> {
         // self.number_to_data.read().await.clone()
         let mut users = self.user_database.lock().await;
@@ -257,15 +254,7 @@ impl RYOKUCHATSession {
         .await;
 
         match user {
-            Ok(o) => Some(
-                o.into_iter()
-                    .map(|u| UserData {
-                        id: PublicKey::try_from(u.id.as_slice()).unwrap(),
-                        hostname: u.hostname,
-                        username: u.username,
-                    })
-                    .collect(),
-            ),
+            Ok(o) => Some(o.into_iter().map(|u| u.to_userdata().unwrap()).collect()),
             Err(_) => None,
         }
     }
@@ -273,9 +262,9 @@ impl RYOKUCHATSession {
     /// 動作の説明:  
     /// IDからユーザー情報を取得します  
     /// 引数について:  
-    /// IDを指定します  
+    /// 引数にはIDを入れてください
     /// 返り値について:  
-    /// データベースから取得したユーザー情報が返ってきます  
+    /// 成功ならばSomeに包まれたユーザー情報が、失敗ならばNoneが返ります  
     pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<UserData> {
         let mut users = self.user_database.lock().await;
 
@@ -291,11 +280,7 @@ impl RYOKUCHATSession {
         };
 
         match user {
-            Some(s) => Some(UserData {
-                id: PublicKey::try_from(s.id.as_slice()).unwrap(),
-                hostname: s.hostname,
-                username: s.username,
-            }),
+            Some(s) => Some(s.to_userdata()?),
             None => None,
         }
     }
@@ -309,15 +294,12 @@ impl RYOKUCHATSession {
     /// 返り値について:  
     /// 成功ならばSome(())、失敗ならばNoneが返ります  
     pub async fn add_user(&self, address: &str) -> Option<()> {
-        let user = match decode_address(address) {
-            Some(s) => s,
-            None => return None,
-        };
+        let user = decode_address(address)?;
 
         let mut users = self.user_database.lock().await;
 
         match sqlx::query("SELECT id FROM users WHERE id=? LIMIT 1;")
-            .bind(user.id.as_slice())
+            .bind(user.id.as_byte().as_slice())
             .fetch_optional(&mut *users)
             .await
         {
@@ -327,7 +309,7 @@ impl RYOKUCHATSession {
                         "INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);",
                     )
                     .bind(chrono::Local::now().timestamp())
-                    .bind(user.id.as_slice())
+                    .bind(user.id.as_byte().as_slice())
                     .bind(user.hostname)
                     .execute(&mut *users)
                     .await
@@ -344,6 +326,10 @@ impl RYOKUCHATSession {
 
     /// 動作の説明:  
     /// 連絡先リストからユーザーを削除します  
+    /// 引数について:  
+    /// 引数にはIDを入れてください  
+    /// 返り値について:  
+    /// 成功ならばSome(())が、失敗ならばNoneが返ります  
     pub async fn del_user(&self, id: &PublicKey) -> Option<()> {
         let mut users = self.user_database.lock().await;
         match sqlx::query("DELETE FROM users WHERE id=?;")
@@ -358,6 +344,11 @@ impl RYOKUCHATSession {
 
     /// 動作の説明:  
     /// メッセージを送信します  
+    /// 引数について:  
+    /// 第1引数にはIDを入れてください  
+    /// 第2引数には送信したいメッセージを入れます  
+    /// 返り値について:  
+    /// 成功ならばSome(())が、失敗ならばNoneが返ります  
     pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
         let msg = msg.trim();
 
@@ -389,16 +380,14 @@ impl RYOKUCHATSession {
         Some(())
     }
 
+    // 新しく接続を開始する
     async fn new_connection(&self, userdata: UserData) -> Option<()> {
-        let mut stream = match tokio_socks::tcp::Socks5Stream::connect(
+        let mut stream = tokio_socks::tcp::Socks5Stream::connect(
             format!("[::1]:{}", self.socks_port).as_str(),
             format!("{}:4545", userdata.hostname),
         )
         .await
-        {
-            Ok(o) => o,
-            Err(_) => return None,
-        };
+        .ok()?;
 
         // 57バイトの公開鍵(ID)
         let pubkey = PublicKey::try_from(&self.myprivkey).ok()?;
@@ -421,6 +410,7 @@ impl RYOKUCHATSession {
         Some(())
     }
 
+    // ユーザーの最終更新を現在の時刻に変更する
     async fn new_lastupdate(&self, id: &PublicKey) -> Option<()> {
         let mut users = self.user_database.lock().await;
         match sqlx::query("UPDATE users SET lastupdate=? WHERE id=? LIMIT 1;")
@@ -442,10 +432,6 @@ pub struct UserData {
     pub hostname: String,
     // stub: ユーザーネームを取得できるようにする
     pub username: Option<String>,
-    // send: Mutex<
-    //     Option<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
-    // >,
-    // handle: Mutex<Option<HandleWrapper>>,
 }
 
 impl UserData {
@@ -473,11 +459,23 @@ enum MessageForNetwork {
 }
 
 //以下非公開
+
+// SQLiteに入れておける形式のUserData
 #[derive(sqlx::FromRow)]
 struct UserDataRaw {
     id: Vec<u8>,
     hostname: String,
     username: Option<String>,
+}
+
+impl UserDataRaw {
+    fn to_userdata(&self) -> Option<UserData> {
+        Some(UserData {
+            id: PublicKey::try_from(self.id.as_slice()).ok()?,
+            hostname: self.hostname.clone(),
+            username: self.username.clone(),
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -524,7 +522,6 @@ async fn process_message<
     );
 }
 
-#[allow(clippy::collapsible_match, clippy::single_match)]
 async fn process_message2<
     T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
@@ -561,28 +558,20 @@ async fn process_message2<
     None
 }
 
-fn decode_address(address: &str) -> Option<UserDataRaw> {
+fn decode_address(address: &str) -> Option<UserData> {
     let mut address = address.split('@');
 
-    let key = match address.next() {
-        Some(s) => s,
-        None => return None,
-    };
-    let key = match base64::decode_config(key, base64::URL_SAFE_NO_PAD) {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
+    let key = address.next()?;
+    let key = base64::decode_config(key, base64::URL_SAFE_NO_PAD).ok()?;
 
-    let hostname = match address.next() {
-        Some(s) => s.to_string(),
-        None => return None,
-    };
+    let hostname = address.next()?.to_string();
 
-    Some(UserDataRaw {
+    UserDataRaw {
         id: key,
         hostname,
         username: None,
-    })
+    }
+    .to_userdata()
 }
 
 fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
