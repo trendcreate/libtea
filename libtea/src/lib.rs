@@ -360,34 +360,32 @@ impl RYOKUCHATSession {
     /// メッセージを送信します  
     pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
         let msg = msg.trim();
-        let mut len: u64 = match TryFrom::try_from(msg.len()) {
-            Ok(o) => o,
-            Err(_) => return None,
-        };
-        if len == 0 {
-            return None;
-        }
-        len += 2;
 
-        let user = match self.get_user_from_id(id).await {
-            Some(s) => s,
-            None => return None,
-        };
-        let user_data_temp = self.user_data_temp.read().await;
-        if user_data_temp.get(&id.as_byte()).is_none() {
-            drop(user_data_temp);
-            self.new_connection(user).await?;
-        } else {
-            drop(user_data_temp);
+        loop {
+            let user_data_temp = self.user_data_temp.read().await;
+            match user_data_temp.get(&id.as_byte()) {
+                Some(s) => {
+                    let send_data = MessageForNetwork::DirectMsg(msg.to_string());
+                    let send_data = bincode::serialize(&send_data).ok()?;
+                    let mut sender = s.send.lock().await;
+                    sender
+                        .write_all(&(send_data.len() as u64).to_be_bytes())
+                        .await
+                        .ok()?;
+                    sender.write_all(&send_data).await.ok()?;
+                    sender.flush().await.ok()?;
+                    break;
+                }
+                None => {
+                    drop(user_data_temp);
+                    let user = match self.get_user_from_id(id).await {
+                        Some(s) => s,
+                        None => return None,
+                    };
+                    self.new_connection(user).await?;
+                }
+            }
         }
-
-        let user_data_temp = self.user_data_temp.read().await;
-        let usertemp = unsafe { user_data_temp.get(&id.as_byte()).unwrap_unchecked() };
-        let mut send = usertemp.send.lock().await;
-        send.write_all(&len.to_be_bytes()).await.ok()?;
-        send.write_all(&0_u16.to_be_bytes()).await.ok()?;
-        send.write_all(msg.as_bytes()).await.ok()?;
-        send.flush().await.ok()?;
         Some(())
     }
 
@@ -471,6 +469,16 @@ pub enum Message {
     DirectMsg(PublicKey, String),
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+enum MessageForNetwork {
+    DirectMsg(String),
+}
+
+// #[derive(serde::Serialize, serde::Deserialize)]
+// struct Greeting {
+//     DirectMsg(Vec<u8>, String),
+// }
+
 //以下非公開
 #[derive(sqlx::FromRow)]
 struct UserDataRaw {
@@ -533,46 +541,33 @@ async fn process_message2<
 ) -> Option<()> {
     // メッセージのサイズを受信
     let mut len = [0; 8];
-    if read.read_exact(&mut len).await.is_ok() {
-        let mut len = Cursor::new(len);
-        let len = match byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len) {
-            Ok(len) => len,
-            Err(_) => return None,
-        };
-        let len: usize = match TryFrom::try_from(len) {
-            Ok(len) => len,
-            Err(_) => return None,
-        };
-        if 2 < len && len < MAXMSGLEN {
-            // メッセージ種別を受信
-            let mut buf = vec![0; len];
-            if read.read_exact(&mut buf).await.is_ok() {
-                let mut kind = Cursor::new(&buf[..2]);
-                let kind = match byteorder::ReadBytesExt::read_u16::<BigEndian>(&mut kind) {
-                    Ok(kind) => kind,
-                    Err(_) => return None,
-                };
-                match kind {
-                    0 => {
-                        let msg = &buf[2..];
-                        let msg = match std::str::from_utf8(msg) {
-                            Ok(msg) => msg,
-                            Err(_) => return None,
-                        };
-                        // stub: メッセージ履歴の保存を実装
-                        session.new_lastupdate(userid).await;
+    read.read_exact(&mut len).await.ok()?;
+    let mut len = Cursor::new(len);
+    let len = match byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len) {
+        Ok(len) => len,
+        Err(_) => return None,
+    };
+    let len: usize = match TryFrom::try_from(len) {
+        Ok(len) => len,
+        Err(_) => return None,
+    };
+    if len < MAXMSGLEN {
+        let mut msg = vec![0; len];
+        read.read_exact(&mut msg).await.ok()?;
+        let msg: MessageForNetwork = bincode::deserialize(&msg).ok()?;
+        match msg {
+            MessageForNetwork::DirectMsg(msg) => {
+                // stub: メッセージ履歴の保存を実装
+                session.new_lastupdate(userid).await;
 
-                        match &mut *session.notify.lock().await {
-                            Some(s) => {
-                                let userid = userid.clone();
-                                let _ = s.send(Message::DirectMsg(userid, msg.to_string())).await;
-                            }
-                            None => (),
-                        }
-                        return Some(());
+                match &mut *session.notify.lock().await {
+                    Some(s) => {
+                        let userid = userid.clone();
+                        let _ = s.send(Message::DirectMsg(userid, msg)).await;
                     }
-                    _ => return None,
+                    None => (),
                 }
+                return Some(());
             }
         }
     }
