@@ -356,6 +356,9 @@ impl RYOKUCHATSession {
     /// 成功ならばSome(())が、失敗ならばNoneが返ります  
     pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
         let msg = msg.trim();
+        if msg.is_empty() {
+            return None;
+        }
 
         loop {
             let user_data_temp = self.user_data_temp.read().await;

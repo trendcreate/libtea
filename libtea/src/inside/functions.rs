@@ -89,6 +89,10 @@ async fn process_message2<
         match msg {
             MessageForNetwork::DirectMsg(msg) => {
                 // stub: メッセージ履歴の保存を実装
+                if msg.is_empty() {
+                    return None;
+                }
+
                 session.new_lastupdate(userid).await?;
 
                 match &mut *session.notify.lock().await {
