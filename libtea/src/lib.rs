@@ -19,21 +19,27 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use std::{
-    collections::HashMap, convert::TryFrom, future::Future, io::Cursor, path::PathBuf,
-    time::Duration,
+pub mod consts;
+mod inside;
+
+use crate::{
+    consts::{KEY_LENGTH, SIG_LENGTH},
+    inside::{
+        functions::{decode_address, greeting_auth, process_message, try_open_read},
+        structs::{HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
+    },
 };
 
-use byteorder::BigEndian;
+use std::{collections::HashMap, convert::TryFrom, path::PathBuf, time::Duration};
+
 use ed448_rust::{PrivateKey, PublicKey};
 use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream},
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::TcpListener,
     process::Command,
     sync::{mpsc::Sender, Mutex, RwLock},
-    task::JoinHandle,
 };
 
 use rand::Rng;
@@ -49,13 +55,10 @@ pub struct RYOKUCHATSession {
     myprivkey: PrivateKey,
     socks_port: u16,
     user_database: Mutex<sqlx::SqliteConnection>,
-    user_data_temp: RwLock<HashMap<[u8; 57], UserDataTemp>>,
+    user_data_temp: RwLock<HashMap<[u8; KEY_LENGTH], UserDataTemp>>,
     pub notify: Mutex<Option<Sender<Message>>>,
-    pub myaddress: String,
+    myaddress: String,
 }
-
-/// メッセージの最大の長さです  
-pub const MAXMSGLEN: usize = 125000 + 2;
 
 impl RYOKUCHATSession {
     /// 動作の説明:  
@@ -96,6 +99,10 @@ impl RYOKUCHATSession {
                 .unwrap();
         sqlite
             .execute("CREATE TABLE IF NOT EXISTS users (lastupdate INTEGER NOT NULL, id BLOB NOT NULL, hostname TEXT NOT NULL, username TEXT);")
+            .await
+            .unwrap();
+        sqlite
+            .execute("CREATE INDEX IF NOT EXISTS search ON users(lastupdate, id);")
             .await
             .unwrap();
         data_dir.pop();
@@ -153,7 +160,7 @@ impl RYOKUCHATSession {
 
         // 秘密鍵を読み出し､鍵のペアを用意する
         data_dir.push("DO_NOT_SEND_TO_OTHER_PEOPLE_secretkey.ykr");
-        let mut secretkey: [u8; 57] = [0; 57];
+        let mut secretkey = [0; KEY_LENGTH];
         try_open_read(&data_dir, |mut f| async move {
             f.write_all(PrivateKey::new(&mut rand::rngs::OsRng).as_bytes())
                 .await?;
@@ -210,7 +217,7 @@ impl RYOKUCHATSession {
                     Ok((o, _)) => tokio::spawn(async move {
                         let mut stream = BufStream::new(o);
                         // 57バイトの公開鍵(ID)
-                        let mut key = [0; 57];
+                        let mut key = [0; KEY_LENGTH];
                         stream.read_exact(&mut key).await.ok()?;
                         let key = PublicKey::try_from(&key).ok()?;
 
@@ -221,7 +228,7 @@ impl RYOKUCHATSession {
                         let auth = rand::rngs::OsRng.gen::<u128>().to_be_bytes();
                         stream.write_all(&auth).await.ok()?;
                         stream.flush().await.ok()?;
-                        let mut sign = [0; 114];
+                        let mut sign = [0; SIG_LENGTH];
                         stream.read_exact(&mut sign).await.ok()?;
                         user.id
                             .verify(&greeting_auth(&auth).unwrap(), &sign, None)
@@ -237,6 +244,13 @@ impl RYOKUCHATSession {
         session.handles.push(HandleWrapper(handle));
 
         session
+    }
+
+    /// 動作の説明:  
+    /// 自分自身のアドレスを取得します  
+    /// これを相手に渡すことで通信が出来ます  
+    pub fn myaddress(&self) -> &str {
+        &self.myaddress
     }
 
     /// 動作の説明:  
@@ -298,29 +312,20 @@ impl RYOKUCHATSession {
 
         let mut users = self.user_database.lock().await;
 
-        match sqlx::query("SELECT id FROM users WHERE id=? LIMIT 1;")
-            .bind(user.id.as_byte().as_slice())
-            .fetch_optional(&mut *users)
-            .await
-        {
-            Ok(o) => {
-                if o.is_none() {
-                    match sqlx::query(
-                        "INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);",
-                    )
+        match self.get_user_from_id(&user.id).await {
+            None => {
+                match sqlx::query("INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);")
                     .bind(chrono::Local::now().timestamp())
                     .bind(user.id.as_byte().as_slice())
                     .bind(user.hostname)
                     .execute(&mut *users)
                     .await
-                    {
-                        Ok(_) => return Some(()),
-                        Err(_) => return None,
-                    }
+                {
+                    Ok(_) => Some(()),
+                    Err(_) => None,
                 }
-                None
             }
-            Err(_) => None,
+            Some(_) => None,
         }
     }
 
@@ -365,14 +370,12 @@ impl RYOKUCHATSession {
                         .ok()?;
                     sender.write_all(&send_data).await.ok()?;
                     sender.flush().await.ok()?;
+                    self.new_lastupdate(id).await?;
                     break;
                 }
                 None => {
                     drop(user_data_temp);
-                    let user = match self.get_user_from_id(id).await {
-                        Some(s) => s,
-                        None => return None,
-                    };
+                    let user = self.get_user_from_id(id).await?;
                     self.new_connection(user).await?;
                 }
             }
@@ -413,7 +416,7 @@ impl RYOKUCHATSession {
     // ユーザーの最終更新を現在の時刻に変更する
     async fn new_lastupdate(&self, id: &PublicKey) -> Option<()> {
         let mut users = self.user_database.lock().await;
-        match sqlx::query("UPDATE users SET lastupdate=? WHERE id=? LIMIT 1;")
+        match sqlx::query("UPDATE users SET lastupdate=? WHERE id=?;")
             .bind(chrono::Local::now().timestamp())
             .bind(id.as_byte().as_slice())
             .execute(&mut *users)
@@ -451,150 +454,4 @@ pub enum Message {
     /// 新しい通常のメッセージが来た場合の情報を格納します  
     /// 1つ目にユーザーID、2つ目にメッセージが入ります  
     DirectMsg(PublicKey, String),
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-enum MessageForNetwork {
-    DirectMsg(String),
-}
-
-//以下非公開
-
-// SQLiteに入れておける形式のUserData
-#[derive(sqlx::FromRow)]
-struct UserDataRaw {
-    id: Vec<u8>,
-    hostname: String,
-    username: Option<String>,
-}
-
-impl UserDataRaw {
-    fn to_userdata(&self) -> Option<UserData> {
-        Some(UserData {
-            id: PublicKey::try_from(self.id.as_slice()).ok()?,
-            hostname: self.hostname.clone(),
-            username: self.username.clone(),
-        })
-    }
-}
-
-#[allow(dead_code)]
-struct UserDataTemp {
-    send: Mutex<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
-    handle: HandleWrapper,
-}
-
-struct HandleWrapper(JoinHandle<()>);
-
-impl std::ops::Drop for HandleWrapper {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-async fn process_message<
-    T: 'static + AsyncRead + AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin,
->(
-    session: &RYOKUCHATSession,
-    userid: PublicKey,
-    stream: T,
-) {
-    let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(session) };
-    let (mut read, write) = tokio::io::split(BufStream::new(stream));
-    session.user_data_temp.write().await.insert(
-        userid.as_byte(),
-        UserDataTemp {
-            send: Mutex::new(Box::new(write)),
-            handle: HandleWrapper(tokio::spawn(async move {
-                loop {
-                    let a = process_message2(session, &userid, &mut read).await;
-                    if a.is_none() {
-                        session
-                            .user_data_temp
-                            .write()
-                            .await
-                            .remove(&userid.as_byte());
-                        return;
-                    }
-                }
-            })),
-        },
-    );
-}
-
-async fn process_message2<
-    T: AsyncRead + std::marker::Send + std::marker::Sync + std::marker::Unpin,
->(
-    session: &RYOKUCHATSession,
-    userid: &PublicKey,
-    read: &mut T,
-) -> Option<()> {
-    // メッセージのサイズを受信
-    let mut len = [0; 8];
-    read.read_exact(&mut len).await.ok()?;
-    let mut len = Cursor::new(len);
-    let len = byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len).ok()?;
-    let len: usize = TryFrom::try_from(len).ok()?;
-    if len < MAXMSGLEN {
-        let mut msg = vec![0; len];
-        read.read_exact(&mut msg).await.ok()?;
-        let msg: MessageForNetwork = bincode::deserialize(&msg).ok()?;
-        match msg {
-            MessageForNetwork::DirectMsg(msg) => {
-                // stub: メッセージ履歴の保存を実装
-                session.new_lastupdate(userid).await;
-
-                match &mut *session.notify.lock().await {
-                    Some(s) => {
-                        let userid = userid.clone();
-                        let _ = s.send(Message::DirectMsg(userid, msg)).await;
-                    }
-                    None => (),
-                }
-                return Some(());
-            }
-        }
-    }
-    None
-}
-
-fn decode_address(address: &str) -> Option<UserData> {
-    let mut address = address.split('@');
-
-    let key = address.next()?;
-    let key = base64::decode_config(key, base64::URL_SAFE_NO_PAD).ok()?;
-
-    let hostname = address.next()?.to_string();
-
-    UserDataRaw {
-        id: key,
-        hostname,
-        username: None,
-    }
-    .to_userdata()
-}
-
-fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
-    let mut auth = Cursor::new(auth);
-    let auth = byteorder::ReadBytesExt::read_u128::<BigEndian>(&mut auth).ok()?;
-    Some(auth.to_le_bytes())
-}
-
-async fn try_open_read<
-    F: Fn(fs::File) -> R,
-    R: Future<Output = Result<(), Box<dyn std::error::Error>>>,
->(
-    path: &std::path::Path,
-    initfn: F,
-) -> Result<fs::File, Box<dyn std::error::Error>> {
-    if let Ok(o) = fs::File::open(&path).await {
-        return Ok(o);
-    }
-
-    if let Ok(o) = fs::File::create(&path).await {
-        initfn(o).await?;
-        return Ok(fs::File::open(&path).await?);
-    }
-
-    panic!("Could not open and create {:?}", path);
 }

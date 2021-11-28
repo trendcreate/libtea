@@ -81,7 +81,7 @@ async fn main2() {
     *session.notify.lock().await = Some(send);
 
     loop {
-        println!("Your address is: {}", &session.myaddress);
+        println!("Your address is: {}", &session.myaddress());
         println!("/help to command list.");
         println!("Input index of friend or command.");
         let mut temp: usize = 0;
