@@ -210,26 +210,26 @@ impl RYOKUCHATSession {
                 match listen.accept().await {
                     Ok((o, _)) => tokio::spawn(async move {
                         let mut stream = BufStream::new(o);
-                        // 57バイトの公開鍵(ID)と8バイトのメッセージと114バイトの署名
-                        let mut buf = [0; 57 + 8 + 114];
-                        match stream.read_exact(&mut buf).await {
-                            Ok(_) => (),
-                            Err(_) => return,
-                        }
-                        let key = match PublicKey::try_from(&buf[0..57]) {
-                            Ok(o) => o,
-                            Err(_) => return,
-                        };
-                        // 連絡先リストに相手のアドレスがあることを確認
+                        // 57バイトの公開鍵(ID)
+                        let mut key = [0; 57];
+                        stream.read_exact(&mut key).await.ok()?;
+                        let key = PublicKey::try_from(&key).ok()?;
 
+                        // 連絡先リストに相手のアドレスがあることを確認
                         if let Some(s) = session.get_user_from_id(&key).await {
-                            if s.id
-                                .verify(&buf[57..57 + 8], &buf[57 + 8..57 + 8 + 114], None)
-                                .is_ok()
-                            {
-                                process_message(session, key, stream).await;
-                            }
+                            // 16バイトの認証用メッセージ
+                            let auth = rand::rngs::OsRng.gen::<u128>().to_be_bytes();
+                            stream.write_all(&auth).await.ok()?;
+                            stream.flush().await.ok()?;
+                            let mut sign = [0; 114];
+                            stream.read_exact(&mut sign).await.ok()?;
+                            s.id.verify(&greeting_auth(&auth).unwrap(), &sign, None)
+                                .ok()?;
+
+                            process_message(session, key, stream).await;
+                            return Some(());
                         }
+                        None
                     }),
                     Err(_) => continue,
                 };
@@ -400,22 +400,20 @@ impl RYOKUCHATSession {
             Err(_) => return None,
         };
 
-        // 57バイトの公開鍵(ID)を送信
-        let pubkey = match PublicKey::try_from(&self.myprivkey) {
-            Ok(o) => o,
-            Err(_) => return None,
-        };
+        // 57バイトの公開鍵(ID)
+        let pubkey = PublicKey::try_from(&self.myprivkey).ok()?;
         stream.write_all(&pubkey.as_byte()).await.ok()?;
+        stream.flush().await.ok()?;
 
-        // 8バイトの検証用メッセージを送信
-        let random = rand::rngs::OsRng.gen::<u64>().to_be_bytes();
-        stream.write_all(&random).await.ok()?;
+        // 16バイトの検証用メッセージ
+        let mut auth = [0; 16];
+        stream.read_exact(&mut auth).await.ok()?;
 
-        // 114バイトの署名を送信
-        let sign = match self.myprivkey.sign(&random, None) {
-            Ok(o) => o,
-            Err(_) => return None,
-        };
+        // 114バイトの署名
+        let sign = self
+            .myprivkey
+            .sign(&greeting_auth(&auth).unwrap(), None)
+            .ok()?;
         stream.write_all(&sign).await.ok()?;
         stream.flush().await.ok()?;
 
@@ -473,11 +471,6 @@ pub enum Message {
 enum MessageForNetwork {
     DirectMsg(String),
 }
-
-// #[derive(serde::Serialize, serde::Deserialize)]
-// struct Greeting {
-//     DirectMsg(Vec<u8>, String),
-// }
 
 //以下非公開
 #[derive(sqlx::FromRow)]
@@ -543,14 +536,8 @@ async fn process_message2<
     let mut len = [0; 8];
     read.read_exact(&mut len).await.ok()?;
     let mut len = Cursor::new(len);
-    let len = match byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len) {
-        Ok(len) => len,
-        Err(_) => return None,
-    };
-    let len: usize = match TryFrom::try_from(len) {
-        Ok(len) => len,
-        Err(_) => return None,
-    };
+    let len = byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len).ok()?;
+    let len: usize = TryFrom::try_from(len).ok()?;
     if len < MAXMSGLEN {
         let mut msg = vec![0; len];
         read.read_exact(&mut msg).await.ok()?;
@@ -596,6 +583,12 @@ fn decode_address(address: &str) -> Option<UserDataRaw> {
         hostname,
         username: None,
     })
+}
+
+fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
+    let mut auth = Cursor::new(auth);
+    let auth = byteorder::ReadBytesExt::read_u128::<BigEndian>(&mut auth).ok()?;
+    Some(auth.to_le_bytes())
 }
 
 async fn try_open_read<
