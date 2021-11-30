@@ -19,6 +19,8 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
+use std::ops::{Deref, DerefMut};
+
 use ed448_rust::PublicKey;
 use tokio::{io::AsyncWrite, sync::Mutex, task::JoinHandle};
 
@@ -26,7 +28,7 @@ use crate::UserData;
 
 // SQLiteに入れておける形式のUserData
 #[derive(sqlx::FromRow)]
-pub(crate) struct UserDataRaw {
+pub struct UserDataRaw {
     pub id: Vec<u8>,
     pub hostname: String,
     pub username: Option<String>,
@@ -45,14 +47,14 @@ impl UserDataRaw {
 
 // ユーザー情報のうち､ストレージに保存する必要が無いもの
 #[allow(dead_code)]
-pub(crate) struct UserDataTemp {
+pub struct UserDataTemp {
     pub send:
         Mutex<Box<dyn AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin>>,
     pub handle: HandleWrapper,
 }
 
 // drop時にスレッドを終了するラッパー
-pub(crate) struct HandleWrapper(pub JoinHandle<()>);
+pub struct HandleWrapper(pub JoinHandle<()>);
 
 impl std::ops::Drop for HandleWrapper {
     fn drop(&mut self) {
@@ -62,6 +64,51 @@ impl std::ops::Drop for HandleWrapper {
 
 // 通信用の構造体
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub(crate) enum MessageForNetwork {
+pub enum MessageForNetwork {
     DirectMsg(String),
+}
+
+// デバッグメッセージの表示を簡略化するためのトレイト
+pub trait ErrMsg<F: FnOnce(&str)> {
+    fn err_exec(self, function: F) -> Self;
+}
+
+impl<F: FnOnce(&str), T, E: std::fmt::Debug> ErrMsg<F> for std::result::Result<T, E> {
+    fn err_exec(self, function: F) -> Self {
+        match &self {
+            Ok(_) => {}
+            Err(e) => {
+                function(&format!("{:?}", e));
+            }
+        }
+        self
+    }
+}
+
+impl<F: FnOnce(&str), T> ErrMsg<F> for std::option::Option<T> {
+    fn err_exec(self, function: F) -> Self {
+        match &self {
+            Some(_) => {}
+            None => {
+                function("");
+            }
+        }
+        self
+    }
+}
+
+pub struct DeferWrapper<F: FnMut()> {
+    pub f: F,
+}
+
+impl<F: FnMut()> DeferWrapper<F> {
+    pub fn new(f: F) -> DeferWrapper<F> {
+        DeferWrapper { f }
+    }
+}
+
+impl<F: FnMut()> Drop for DeferWrapper<F> {
+    fn drop(&mut self) {
+        (self.f)();
+    }
 }

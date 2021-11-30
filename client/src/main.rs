@@ -48,9 +48,7 @@ async fn main2() {
     println!("Select debug mode:");
     println!("1: As client 1");
     println!("2: As client 2");
-
-    let socks_port;
-    let ryokuchat_port;
+    let port;
     loop {
         let mut stdout = tokio::io::stdout();
         stdout.write_all("> ".as_bytes()).await.unwrap();
@@ -64,20 +62,18 @@ async fn main2() {
         match input {
             "1" => {
                 data_dir.push("client1");
-                socks_port = 4546;
-                ryokuchat_port = 4545;
+                port = 4545;
             }
             "2" => {
                 data_dir.push("client2");
-                socks_port = 1920;
-                ryokuchat_port = 1919;
+                port = 1919;
             }
             _ => continue,
         }
         break;
     }
 
-    let session = libtea::RYOKUCHATSession::new(data_dir, socks_port, ryokuchat_port).await;
+    let session = libtea::RYOKUCHATSession::new(data_dir, port).await;
     let (send, mut receive) = tokio::sync::mpsc::channel(1);
     *session.notify.lock().await = Some(send);
 

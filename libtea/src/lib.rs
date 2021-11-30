@@ -19,8 +19,9 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-pub mod consts;
+#[macro_use]
 mod inside;
+pub mod consts;
 
 #[macro_use]
 extern crate log;
@@ -29,11 +30,13 @@ use crate::{
     consts::{KEY_LENGTH, SIG_LENGTH},
     inside::{
         functions::{decode_address, greeting_auth, process_message, try_open_read},
-        structs::{HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
+        structs::{
+            DeferWrapper, ErrMsg, HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp,
+        },
     },
 };
 
-use std::{collections::HashMap, convert::TryFrom, path::PathBuf, time::Duration};
+use std::{collections::HashMap, convert::TryFrom, net::IpAddr, path::PathBuf, time::Duration};
 
 use ed448_rust::{PrivateKey, PublicKey};
 use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
@@ -56,6 +59,7 @@ use sqlx::{Connection, Executor};
 pub struct RYOKUCHATSession {
     handles: Vec<HandleWrapper>,
     myprivkey: PrivateKey,
+    localhost: String,
     socks_port: u16,
     user_database: Mutex<sqlx::SqliteConnection>,
     user_data_temp: RwLock<HashMap<[u8; KEY_LENGTH], UserDataTemp>>,
@@ -72,15 +76,29 @@ impl RYOKUCHATSession {
     /// 3: Tor Hidden Serviceを経由して送られてきたリクエストを受け付けるためのポートを指定します  
     /// 返り値について:  
     /// Boxで包まれたRYOKUCHATSessionが返ってきます  
-    pub async fn new(
-        mut data_dir: PathBuf,
-        socks_port: u16,
-        ryokuchat_port: u16,
-    ) -> Box<RYOKUCHATSession> {
+    pub async fn new(mut data_dir: PathBuf, port: u16) -> Box<RYOKUCHATSession> {
         trace!("RYOKUCHATSession::new() is called.");
+        defer!(trace!("reterning from RYOKUCHATSession::new()"));
         debug!("data_dir is {:?}", &data_dir);
-        debug!("socks_port is {}", socks_port);
+
+        // それぞれの用途のポート番号を決める
+        let ryokuchat_port = port;
+        let socks_port = port + 1;
         debug!("ryokuchat_port is {}", ryokuchat_port);
+        debug!("socks_port is {}", socks_port);
+
+        // localhostのアドレスを取得
+        let localhost = match tokio::net::lookup_host("localhost:1")
+            .await
+            .unwrap()
+            .next()
+            .unwrap()
+            .ip()
+        {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => "[".to_string() + &v6.to_string() + "]",
+        };
+        debug!("localhost is {}", localhost);
 
         // ディレクトリを作成
         data_dir.push("tor");
@@ -143,6 +161,7 @@ impl RYOKUCHATSession {
         debug!("DataDirectory of Tor is {:?}", &tor_dir);
         debug!("HiddenServiceDir of Tor is {:?}", &hidden_dir);
         debug!("ConfigFile of Tor is {:?}", &tor_config);
+        let localhost2 = localhost.clone();
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
                 .flag(TorFlag::Quiet())
@@ -158,14 +177,10 @@ impl RYOKUCHATSession {
                 .flag(TorFlag::HiddenServiceVersion(HiddenServiceVersion::V3))
                 .flag(TorFlag::HiddenServicePort(
                     TorAddress::Port(4545),
-                    Some(TorAddress::AddressPort(
-                        "localhost".to_string(),
-                        ryokuchat_port,
-                    ))
-                    .into(),
+                    Some(TorAddress::AddressPort(localhost2.clone(), ryokuchat_port)).into(),
                 ))
                 .flag(TorFlag::SocksPortAddress(
-                    TorAddress::AddressPort("localhost".to_string(), socks_port),
+                    TorAddress::AddressPort(localhost2.clone(), socks_port),
                     None.into(),
                     None.into(),
                 ))
@@ -221,6 +236,7 @@ impl RYOKUCHATSession {
         let mut session = Box::new(RYOKUCHATSession {
             handles: vec![HandleWrapper(torhandle)],
             myprivkey: secretkey,
+            localhost,
             socks_port,
             user_database: Mutex::const_new(sqlite),
             user_data_temp: RwLock::const_new(HashMap::new()),
@@ -233,21 +249,29 @@ impl RYOKUCHATSession {
         let s = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(&*session) };
         let handle = tokio::spawn(async move {
             let session = s;
-            let listen = TcpListener::bind(format!("localhost:{}", ryokuchat_port))
+            let listen = TcpListener::bind(format!("{}:{}", &session.localhost, ryokuchat_port))
                 .await
                 .unwrap();
             debug!("listen loop started");
             loop {
-                match listen.accept().await {
-                    Ok((o, _)) => tokio::spawn(async move {
+                if let Ok((o, _)) = listen.accept().await {
+                    tokio::spawn(async move {
+                        info!("new connection come");
+
                         let mut stream = BufStream::new(o);
+
                         // 57バイトの公開鍵(ID)
                         let mut key = [0; KEY_LENGTH];
                         stream.read_exact(&mut key).await.ok()?;
-                        let key = PublicKey::try_from(&key).ok()?;
+                        let key = PublicKey::try_from(&key)
+                            .err_exec(|e| error!("{}", e))
+                            .ok()?;
 
                         // 連絡先リストに相手のアドレスがあることを確認
-                        let user = session.get_user_from_id(&key).await?;
+                        let user = session
+                            .get_user_from_id(&key)
+                            .await
+                            .err_exec(|_| error!("This connection is from an unknown source."))?;
 
                         // 16バイトの認証用メッセージ
                         let auth = rand::rngs::OsRng.gen::<u128>().to_be_bytes();
@@ -257,16 +281,15 @@ impl RYOKUCHATSession {
                         stream.read_exact(&mut sign).await.ok()?;
                         user.id
                             .verify(&greeting_auth(&auth).unwrap(), &sign, None)
+                            .err_exec(|_| error!("failed to verify the connection source"))
                             .ok()?;
+
+                        info!("this connection is from {}", user.get_address());
 
                         process_message(session, key, stream).await;
                         Some(())
-                    }),
-                    Err(_) => {
-                        debug!("new connection came, but I couldn't accept it");
-                        continue;
-                    }
-                };
+                    });
+                }
             }
         });
         session.handles.push(HandleWrapper(handle));
@@ -278,6 +301,10 @@ impl RYOKUCHATSession {
     /// 自分自身のアドレスを取得します  
     /// これを相手に渡すことで通信が出来ます  
     pub fn myaddress(&self) -> &str {
+        trace!("RYOKUCHATSession::myaddress() is called");
+        defer!(trace!("returning from RYOKUCHATSession::myaddress()"));
+
+        debug!("self.myaddress is {}", &self.myaddress);
         &self.myaddress
     }
 
@@ -286,19 +313,21 @@ impl RYOKUCHATSession {
     /// 注意点:  
     /// 内部の連絡先リストと同期はされないため自分で変更を適用するか定期的に再取得してください  
     pub async fn get_users(&self) -> Option<Vec<UserData>> {
-        // self.number_to_data.read().await.clone()
-        let mut users = self.user_database.lock().await;
+        let mut database = self.user_database.lock().await;
 
-        let user = sqlx::query_as::<_, UserDataRaw>(
+        let users = sqlx::query_as::<_, UserDataRaw>(
             "SELECT id,hostname,username FROM users ORDER BY lastupdate DESC;",
         )
-        .fetch_all(&mut *users)
+        .fetch_all(&mut *database)
         .await;
 
-        match user {
-            Ok(o) => Some(o.into_iter().map(|u| u.to_userdata().unwrap()).collect()),
-            Err(_) => None,
-        }
+        let users = users.err_exec(|e| error!("{}", e)).ok()?;
+        let users = users
+            .into_iter()
+            .map(|u| u.to_userdata().unwrap())
+            .collect();
+
+        Some(users)
     }
 
     /// 動作の説明:  
@@ -308,23 +337,23 @@ impl RYOKUCHATSession {
     /// 返り値について:  
     /// 成功ならばSomeに包まれたユーザー情報が、失敗ならばNoneが返ります  
     pub async fn get_user_from_id(&self, id: &PublicKey) -> Option<UserData> {
+        trace!("RYOKUCHATSession::get_user_from_id() is called");
+        defer!(trace!(
+            "returning from RYOKUCHATSession::get_user_from_id()"
+        ));
+
         let mut users = self.user_database.lock().await;
 
-        let user = match sqlx::query_as::<_, UserDataRaw>(
+        let users = sqlx::query_as::<_, UserDataRaw>(
             "SELECT id,hostname,username FROM users WHERE id=? LIMIT 1;",
         )
         .bind(id.as_byte().as_slice())
         .fetch_optional(&mut *users)
         .await
-        {
-            Ok(o) => o,
-            Err(_) => return None,
-        };
+        .err_exec(|e| error!("{}", e))
+        .ok()?;
 
-        match user {
-            Some(s) => Some(s.to_userdata()?),
-            None => None,
-        }
+        users.err_exec(|_| error!("unknown id"))?.to_userdata()
     }
 
     /// 動作の説明:  
@@ -382,8 +411,13 @@ impl RYOKUCHATSession {
     /// 返り値について:  
     /// 成功ならばSome(())が、失敗ならばNoneが返ります  
     pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
+        trace!("RYOKUCHATSession::send_msg() is called");
+        defer!(trace!("returning from RYOKUCHATSession::send_msg()"));
+
         let msg = msg.trim();
+        info!("msg is {}", &msg);
         if msg.is_empty() {
+            error!("tried to send a blank message");
             return None;
         }
 
@@ -405,8 +439,11 @@ impl RYOKUCHATSession {
                 }
                 None => {
                     drop(user_data_temp);
+                    info!("connecting to the other party...");
                     let user = self.get_user_from_id(id).await?;
-                    self.new_connection(user).await?;
+                    self.new_connection(user)
+                        .await
+                        .err_exec(|_| error!("failed to connect"))?;
                 }
             }
         }
@@ -415,12 +452,18 @@ impl RYOKUCHATSession {
 
     // 新しく接続を開始する
     async fn new_connection(&self, userdata: UserData) -> Option<()> {
-        let mut stream = tokio_socks::tcp::Socks5Stream::connect(
-            format!("localhost:{}", self.socks_port).as_str(),
+        trace!("RYOKUCHATSession::new_connection() is called");
+        defer!(trace!("returning from RYOKUCHATSession::new_connection()"));
+
+        let stream = tokio_socks::tcp::Socks5Stream::connect(
+            format!("{}:{}", &self.localhost, self.socks_port).as_str(),
             format!("{}:4545", userdata.hostname),
         )
         .await
+        .err_exec(|e| error!("{}", e))
         .ok()?;
+        let mut stream = BufStream::new(stream);
+        info!("created new connection");
 
         // 57バイトの公開鍵(ID)
         let pubkey = PublicKey::try_from(&self.myprivkey).ok()?;
@@ -445,16 +488,19 @@ impl RYOKUCHATSession {
 
     // ユーザーの最終更新を現在の時刻に変更する
     async fn new_lastupdate(&self, id: &PublicKey) -> Option<()> {
+        trace!("RYOKUCHATSession::new_lastupdate() is called");
+        defer!(trace!("returning from RYOKUCHATSession::new_lastupdate()"));
+
         let mut users = self.user_database.lock().await;
-        match sqlx::query("UPDATE users SET lastupdate=? WHERE id=?;")
+        sqlx::query("UPDATE users SET lastupdate=? WHERE id=?;")
             .bind(chrono::Local::now().timestamp())
             .bind(id.as_byte().as_slice())
             .execute(&mut *users)
             .await
-        {
-            Ok(_) => Some(()),
-            Err(_) => None,
-        }
+            .err_exec(|e| error!("{}", e))
+            .ok()?;
+
+        Some(())
     }
 }
 

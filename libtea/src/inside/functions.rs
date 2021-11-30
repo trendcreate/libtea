@@ -36,7 +36,9 @@ use crate::{
     Message, RYOKUCHATSession, UserData,
 };
 
-pub(crate) async fn process_message<
+use super::structs::DeferWrapper;
+
+pub async fn process_message<
     T: 'static + AsyncRead + AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin,
 >(
     session: &RYOKUCHATSession,
@@ -44,12 +46,14 @@ pub(crate) async fn process_message<
     stream: T,
 ) {
     let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(session) };
-    let (mut read, write) = tokio::io::split(BufStream::new(stream));
+    let (mut read, write) = tokio::io::split(stream);
+
     session.user_data_temp.write().await.insert(
         userid.as_byte(),
         UserDataTemp {
             send: Mutex::new(Box::new(write)),
             handle: HandleWrapper(tokio::spawn(async move {
+                defer!(error!("connection closed"));
                 loop {
                     let a = process_message2(session, &userid, &mut read).await;
                     if a.is_none() {
@@ -105,7 +109,7 @@ async fn process_message2<
     None
 }
 
-pub(crate) fn decode_address(address: &str) -> Option<UserData> {
+pub fn decode_address(address: &str) -> Option<UserData> {
     let mut address = address.split('@');
 
     let key = address.next()?;
@@ -121,13 +125,13 @@ pub(crate) fn decode_address(address: &str) -> Option<UserData> {
     .to_userdata()
 }
 
-pub(crate) fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
+pub fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
     let mut auth = Cursor::new(auth);
     let auth = byteorder::ReadBytesExt::read_u128::<BigEndian>(&mut auth).ok()?;
     Some(auth.to_le_bytes())
 }
 
-pub(crate) async fn try_open_read<
+pub async fn try_open_read<
     F: Fn(fs::File) -> R,
     R: Future<Output = Result<(), Box<dyn std::error::Error>>>,
 >(

@@ -19,6 +19,9 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
+// マクロ
+#[macro_use]
+pub(crate) mod macros;
 // 関数
 pub(crate) mod functions;
 // 構造体
