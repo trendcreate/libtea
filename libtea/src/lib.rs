@@ -77,16 +77,24 @@ impl RYOKUCHATSession {
         socks_port: u16,
         ryokuchat_port: u16,
     ) -> Box<RYOKUCHATSession> {
+        trace!("RYOKUCHATSession::new() is called.");
+        debug!("data_dir is {:?}", &data_dir);
+        debug!("socks_port is {}", socks_port);
+        debug!("ryokuchat_port is {}", ryokuchat_port);
+
         // ディレクトリを作成
         data_dir.push("tor");
         data_dir.push("hidden");
         let _ = fs::create_dir_all(&data_dir).await;
+        info!("directory {:?} is created", &data_dir);
+
         data_dir.pop();
         data_dir.push("torrc");
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .open(&data_dir);
+        info!("file {:?} is created", &data_dir);
         data_dir.pop();
         data_dir.pop();
 
@@ -96,6 +104,7 @@ impl RYOKUCHATSession {
             .create(true)
             .write(true)
             .open(&data_dir);
+        info!("file {:?} is created", &data_dir);
         let mut sqlite =
             sqlx::SqliteConnection::connect(&format!("sqlite://{}", data_dir.to_str().unwrap()))
                 .await
@@ -111,15 +120,18 @@ impl RYOKUCHATSession {
         data_dir.pop();
 
         #[cfg(not(target_os = "windows"))]
-        Command::new("chmod")
-            .arg("-R")
-            .arg("700")
-            .arg(data_dir.to_str().unwrap())
-            .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+        {
+            Command::new("chmod")
+                .arg("-R")
+                .arg("1700")
+                .arg(data_dir.to_str().unwrap())
+                .spawn()
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            info!("permission of directory {:?} is set to 1700", &data_dir);
+        }
 
         // Torを起動
         let mut tor_dir = data_dir.clone();
@@ -128,7 +140,9 @@ impl RYOKUCHATSession {
         hidden_dir.push("hidden");
         let mut tor_config = tor_dir.clone();
         tor_config.push("torrc");
-
+        debug!("DataDirectory of Tor is {:?}", &tor_dir);
+        debug!("HiddenServiceDir of Tor is {:?}", &hidden_dir);
+        debug!("ConfigFile of Tor is {:?}", &tor_config);
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
                 .flag(TorFlag::Quiet())
@@ -169,6 +183,7 @@ impl RYOKUCHATSession {
         data_dir.push("DO_NOT_SEND_TO_OTHER_PEOPLE_secretkey.ykr");
         let mut secretkey = [0; KEY_LENGTH];
         try_open_read(&data_dir, |mut f| async move {
+            info!("generating new secretkey");
             f.write_all(PrivateKey::new(&mut rand::rngs::OsRng).as_bytes())
                 .await?;
             Ok(())
@@ -178,6 +193,7 @@ impl RYOKUCHATSession {
         .read_exact(&mut secretkey)
         .await
         .unwrap();
+        info!("{:?} is read", &data_dir);
         let secretkey = PrivateKey::try_from(&secretkey).unwrap();
         let publickey = PublicKey::try_from(&secretkey).unwrap();
         data_dir.pop();
@@ -200,6 +216,7 @@ impl RYOKUCHATSession {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         address.push_str(hostname.trim());
+        debug!("myaddress is {}", &address);
 
         let mut session = Box::new(RYOKUCHATSession {
             handles: vec![HandleWrapper(torhandle)],
@@ -219,6 +236,7 @@ impl RYOKUCHATSession {
             let listen = TcpListener::bind(format!("localhost:{}", ryokuchat_port))
                 .await
                 .unwrap();
+            debug!("listen loop started");
             loop {
                 match listen.accept().await {
                     Ok((o, _)) => tokio::spawn(async move {
@@ -244,7 +262,10 @@ impl RYOKUCHATSession {
                         process_message(session, key, stream).await;
                         Some(())
                     }),
-                    Err(_) => continue,
+                    Err(_) => {
+                        debug!("new connection came, but I couldn't accept it");
+                        continue;
+                    }
                 };
             }
         });
