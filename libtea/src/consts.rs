@@ -19,7 +19,7 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-pub use ed448_rust::{KEY_LENGTH, SIG_LENGTH};
+pub(crate) use ed448_rust::{KEY_LENGTH, SIG_LENGTH};
 
 /// メッセージの最大の長さです  
 pub const MAXMSGLEN: usize = 126000;

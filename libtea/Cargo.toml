@@ -28,6 +28,8 @@ edition = "2021"
 tokio-socks = "0.5"
 byteorder = "1"
 bincode = "1"
+base64 = "0.13"
+log = "0.4"
 
 [dependencies.ed448-rust]
 git = "https://github.com/pdh11/ed448-rust.git"
@@ -45,10 +47,6 @@ features = ["derive", "unstable", "alloc", "rc"]
 [dependencies.rand]
 version = "0.8"
 features = ["nightly", "simd_support", "small_rng", "min_const_gen"]
-
-[dependencies.base64]
-version = "0.13"
-features = ["alloc"]
 
 [dependencies.chrono]
 version = "0.4"

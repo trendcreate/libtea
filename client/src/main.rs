@@ -26,6 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     println!("RYOKUCHAT Copyright (C) 2021 TrendCreate");
     println!("RYOKUCHAT Copyright (C) 2021 WinLinux1028");
     println!("RYOKUCHAT Copyright (C) 2021 TRENDcreate");

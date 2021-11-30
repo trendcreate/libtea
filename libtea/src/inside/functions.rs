@@ -32,12 +32,9 @@ use tokio::{
 
 use crate::{
     consts::MAXMSGLEN,
-    inside::structs::{HandleWrapper, MessageForNetwork, UserDataTemp},
-    RYOKUCHATSession,
+    inside::structs::{HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
+    Message, RYOKUCHATSession, UserData,
 };
-use crate::{Message, UserData};
-
-use super::structs::UserDataRaw;
 
 pub(crate) async fn process_message<
     T: 'static + AsyncRead + AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin,

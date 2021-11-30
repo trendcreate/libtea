@@ -26,6 +26,7 @@ edition = "2021"
 
 [dependencies]
 dirs = "3"
+env_logger = "0.9"
 
 [dependencies.libtea]
 path = "../libtea"

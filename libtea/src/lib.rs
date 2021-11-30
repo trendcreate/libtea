@@ -22,6 +22,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 pub mod consts;
 mod inside;
 
+#[macro_use]
+extern crate log;
+
 use crate::{
     consts::{KEY_LENGTH, SIG_LENGTH},
     inside::{
@@ -141,10 +144,14 @@ impl RYOKUCHATSession {
                 .flag(TorFlag::HiddenServiceVersion(HiddenServiceVersion::V3))
                 .flag(TorFlag::HiddenServicePort(
                     TorAddress::Port(4545),
-                    Some(TorAddress::AddressPort("[::1]".to_string(), ryokuchat_port)).into(),
+                    Some(TorAddress::AddressPort(
+                        "localhost".to_string(),
+                        ryokuchat_port,
+                    ))
+                    .into(),
                 ))
                 .flag(TorFlag::SocksPortAddress(
-                    TorAddress::AddressPort("[::1]".to_string(), socks_port),
+                    TorAddress::AddressPort("localhost".to_string(), socks_port),
                     None.into(),
                     None.into(),
                 ))
@@ -209,7 +216,7 @@ impl RYOKUCHATSession {
         let s = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(&*session) };
         let handle = tokio::spawn(async move {
             let session = s;
-            let listen = TcpListener::bind(format!("[::1]:{}", ryokuchat_port))
+            let listen = TcpListener::bind(format!("localhost:{}", ryokuchat_port))
                 .await
                 .unwrap();
             loop {
@@ -310,10 +317,9 @@ impl RYOKUCHATSession {
     pub async fn add_user(&self, address: &str) -> Option<()> {
         let user = decode_address(address)?;
 
-        let mut users = self.user_database.lock().await;
-
         match self.get_user_from_id(&user.id).await {
             None => {
+                let mut users = self.user_database.lock().await;
                 match sqlx::query("INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);")
                     .bind(chrono::Local::now().timestamp())
                     .bind(user.id.as_byte().as_slice())
@@ -389,7 +395,7 @@ impl RYOKUCHATSession {
     // 新しく接続を開始する
     async fn new_connection(&self, userdata: UserData) -> Option<()> {
         let mut stream = tokio_socks::tcp::Socks5Stream::connect(
-            format!("[::1]:{}", self.socks_port).as_str(),
+            format!("localhost:{}", self.socks_port).as_str(),
             format!("{}:4545", userdata.hostname),
         )
         .await
