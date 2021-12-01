@@ -19,8 +19,6 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use std::ops::{Deref, DerefMut};
-
 use ed448_rust::PublicKey;
 use tokio::{io::AsyncWrite, sync::Mutex, task::JoinHandle};
 

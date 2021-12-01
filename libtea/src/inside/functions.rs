@@ -26,7 +26,7 @@ use ed448_rust::PublicKey;
 use tokio::io::AsyncReadExt;
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncWrite, BufStream},
+    io::{AsyncRead, AsyncWrite},
     sync::Mutex,
 };
 
@@ -35,8 +35,6 @@ use crate::{
     inside::structs::{HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
     Message, RYOKUCHATSession, UserData,
 };
-
-use super::structs::DeferWrapper;
 
 pub async fn process_message<
     T: 'static + AsyncRead + AsyncWrite + std::marker::Send + std::marker::Sync + std::marker::Unpin,

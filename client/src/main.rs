@@ -171,7 +171,7 @@ async fn chat_session(
             handle.abort();
             return;
         }
-        if session.send_msg(&user.id, input).await.is_none() {
+        if session.send_dm(&user.id, input).await.is_none() {
             println!("Error while sending.");
         }
     }

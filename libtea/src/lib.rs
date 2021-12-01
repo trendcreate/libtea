@@ -30,9 +30,7 @@ use crate::{
     consts::{KEY_LENGTH, SIG_LENGTH},
     inside::{
         functions::{decode_address, greeting_auth, process_message, try_open_read},
-        structs::{
-            DeferWrapper, ErrMsg, HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp,
-        },
+        structs::{ErrMsg, HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
     },
 };
 
@@ -280,7 +278,7 @@ impl RYOKUCHATSession {
                         let mut sign = [0; SIG_LENGTH];
                         stream.read_exact(&mut sign).await.ok()?;
                         user.id
-                            .verify(&greeting_auth(&auth).unwrap(), &sign, None)
+                            .verify(&greeting_auth(&auth)?, &sign, None)
                             .err_exec(|_| error!("failed to verify the connection source"))
                             .ok()?;
 
@@ -410,9 +408,9 @@ impl RYOKUCHATSession {
     /// 第2引数には送信したいメッセージを入れます  
     /// 返り値について:  
     /// 成功ならばSome(())が、失敗ならばNoneが返ります  
-    pub async fn send_msg(&self, id: &PublicKey, msg: &str) -> Option<()> {
-        trace!("RYOKUCHATSession::send_msg() is called");
-        defer!(trace!("returning from RYOKUCHATSession::send_msg()"));
+    pub async fn send_dm(&self, id: &PublicKey, msg: &str) -> Option<()> {
+        trace!("RYOKUCHATSession::send_dm() is called");
+        defer!(trace!("returning from RYOKUCHATSession::send_dm()"));
 
         let msg = msg.trim();
         info!("msg is {}", &msg);
@@ -421,68 +419,74 @@ impl RYOKUCHATSession {
             return None;
         }
 
-        loop {
-            let user_data_temp = self.user_data_temp.read().await;
-            match user_data_temp.get(&id.as_byte()) {
-                Some(s) => {
-                    let send_data = MessageForNetwork::DirectMsg(msg.to_string());
-                    let send_data = bincode::serialize(&send_data).ok()?;
-                    let mut sender = s.send.lock().await;
-                    sender
-                        .write_all(&(send_data.len() as u64).to_be_bytes())
-                        .await
-                        .ok()?;
-                    sender.write_all(&send_data).await.ok()?;
-                    sender.flush().await.ok()?;
-                    self.new_lastupdate(id).await?;
-                    break;
-                }
-                None => {
-                    drop(user_data_temp);
-                    info!("connecting to the other party...");
-                    let user = self.get_user_from_id(id).await?;
-                    self.new_connection(user)
-                        .await
-                        .err_exec(|_| error!("failed to connect"))?;
-                }
-            }
-        }
+        self.new_connection(id)
+            .await
+            .err_exec(|_| error!("failed to connect"))?;
+
+        let user_data_temp = self.user_data_temp.read().await;
+        let user_data_temp = user_data_temp
+            .get(&id.as_byte())
+            .err_exec(|_| error!("something went wrong"))?;
+
+        let send_data = MessageForNetwork::DirectMsg(msg.to_string());
+        let send_data = bincode::serialize(&send_data)
+            .err_exec(|e| error!("{}", e))
+            .ok()?;
+
+        let mut sender = user_data_temp.send.lock().await;
+        sender
+            .write_all(&(send_data.len() as u64).to_be_bytes())
+            .await
+            .ok()?;
+        sender.write_all(&send_data).await.ok()?;
+        sender.flush().await.ok()?;
+        self.new_lastupdate(id).await?;
+
         Some(())
     }
 
     // 新しく接続を開始する
-    async fn new_connection(&self, userdata: UserData) -> Option<()> {
+    async fn new_connection(&self, id: &PublicKey) -> Option<()> {
         trace!("RYOKUCHATSession::new_connection() is called");
         defer!(trace!("returning from RYOKUCHATSession::new_connection()"));
 
-        let stream = tokio_socks::tcp::Socks5Stream::connect(
-            format!("{}:{}", &self.localhost, self.socks_port).as_str(),
-            format!("{}:4545", userdata.hostname),
-        )
-        .await
-        .err_exec(|e| error!("{}", e))
-        .ok()?;
-        let mut stream = BufStream::new(stream);
-        info!("created new connection");
+        let user_data_temp = self.user_data_temp.read().await;
+        match user_data_temp.get(&id.as_byte()) {
+            Some(_) => {
+                info!("already connected");
+            }
+            None => {
+                info!("connecting to the other party...");
+                drop(user_data_temp);
 
-        // 57バイトの公開鍵(ID)
-        let pubkey = PublicKey::try_from(&self.myprivkey).ok()?;
-        stream.write_all(&pubkey.as_byte()).await.ok()?;
-        stream.flush().await.ok()?;
+                let userdata = self.get_user_from_id(id).await?;
+                let stream = tokio_socks::tcp::Socks5Stream::connect(
+                    format!("{}:{}", &self.localhost, self.socks_port).as_str(),
+                    format!("{}:4545", userdata.hostname),
+                )
+                .await
+                .err_exec(|e| error!("{}", e))
+                .ok()?;
+                let mut stream = BufStream::new(stream);
+                info!("created new connection");
 
-        // 16バイトの検証用メッセージ
-        let mut auth = [0; 16];
-        stream.read_exact(&mut auth).await.ok()?;
+                // 57バイトの公開鍵(ID)
+                let pubkey = PublicKey::try_from(&self.myprivkey).ok()?;
+                stream.write_all(&pubkey.as_byte()).await.ok()?;
+                stream.flush().await.ok()?;
 
-        // 114バイトの署名
-        let sign = self
-            .myprivkey
-            .sign(&greeting_auth(&auth).unwrap(), None)
-            .ok()?;
-        stream.write_all(&sign).await.ok()?;
-        stream.flush().await.ok()?;
+                // 16バイトの検証用メッセージ
+                let mut auth = [0; 16];
+                stream.read_exact(&mut auth).await.ok()?;
 
-        process_message(self, userdata.id, stream).await;
+                // 114バイトの署名
+                let sign = self.myprivkey.sign(&greeting_auth(&auth)?, None).ok()?;
+                stream.write_all(&sign).await.ok()?;
+                stream.flush().await.ok()?;
+
+                process_message(self, userdata.id, stream).await;
+            }
+        }
         Some(())
     }
 
