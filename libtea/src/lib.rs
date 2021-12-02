@@ -311,15 +311,20 @@ impl RYOKUCHATSession {
     /// 注意点:  
     /// 内部の連絡先リストと同期はされないため自分で変更を適用するか定期的に再取得してください  
     pub async fn get_users(&self) -> Option<Vec<UserData>> {
+        trace!("RYOKUCHATSession::get_users() is called");
+        defer!(trace!("returning from RYOKUCHATSession::get_users()"));
+
         let mut database = self.user_database.lock().await;
 
         let users = sqlx::query_as::<_, UserDataRaw>(
             "SELECT id,hostname,username FROM users ORDER BY lastupdate DESC;",
         )
         .fetch_all(&mut *database)
-        .await;
+        .await
+        .err_exec(|e| error!("{}", e))
+        .ok()?;
+        drop(database);
 
-        let users = users.err_exec(|e| error!("{}", e)).ok()?;
         let users = users
             .into_iter()
             .map(|u| u.to_userdata().unwrap())
@@ -363,6 +368,10 @@ impl RYOKUCHATSession {
     /// 返り値について:  
     /// 成功ならばSome(())、失敗ならばNoneが返ります  
     pub async fn add_user(&self, address: &str) -> Option<()> {
+        trace!("RYOKUCHATSession::add_user() is called");
+        defer!(trace!("returning from RYOKUCHATSession::add_user()"));
+        debug!("address is {}", address);
+
         let user = decode_address(address)?;
 
         match self.get_user_from_id(&user.id).await {
@@ -376,7 +385,10 @@ impl RYOKUCHATSession {
                     .await
                 {
                     Ok(_) => Some(()),
-                    Err(_) => None,
+                    Err(e) => {
+                        error!("{}", e);
+                        None
+                    }
                 }
             }
             Some(_) => None,
@@ -390,6 +402,9 @@ impl RYOKUCHATSession {
     /// 返り値について:  
     /// 成功ならばSome(())が、失敗ならばNoneが返ります  
     pub async fn del_user(&self, id: &PublicKey) -> Option<()> {
+        trace!("RYOKUCHATSession::del_user() is called");
+        defer!(trace!("returning from RYOKUCHATSession::del_user()"));
+
         let mut users = self.user_database.lock().await;
         match sqlx::query("DELETE FROM users WHERE id=?;")
             .bind(id.as_byte().as_slice())
@@ -397,7 +412,10 @@ impl RYOKUCHATSession {
             .await
         {
             Ok(_) => Some(()),
-            Err(_) => None,
+            Err(e) => {
+                error!("{}", e);
+                None
+            }
         }
     }
 
@@ -440,6 +458,7 @@ impl RYOKUCHATSession {
             .ok()?;
         sender.write_all(&send_data).await.ok()?;
         sender.flush().await.ok()?;
+        drop(sender);
         self.new_lastupdate(id).await?;
 
         Some(())
@@ -495,14 +514,18 @@ impl RYOKUCHATSession {
         trace!("RYOKUCHATSession::new_lastupdate() is called");
         defer!(trace!("returning from RYOKUCHATSession::new_lastupdate()"));
 
+        let timestamp = chrono::Local::now().timestamp();
+        debug!("timestamp is {}", timestamp);
+
         let mut users = self.user_database.lock().await;
         sqlx::query("UPDATE users SET lastupdate=? WHERE id=?;")
-            .bind(chrono::Local::now().timestamp())
+            .bind(timestamp)
             .bind(id.as_byte().as_slice())
             .execute(&mut *users)
             .await
             .err_exec(|e| error!("{}", e))
             .ok()?;
+        drop(users);
 
         Some(())
     }

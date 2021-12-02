@@ -30,6 +30,7 @@ use tokio::{
     sync::Mutex,
 };
 
+use crate::inside::structs::ErrMsg;
 use crate::{
     consts::MAXMSGLEN,
     inside::structs::{HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
@@ -108,12 +109,23 @@ async fn process_message2<
 }
 
 pub fn decode_address(address: &str) -> Option<UserData> {
+    trace!("RYOKUCHATSession::decode_address() is called");
+    defer!(trace!("returning from RYOKUCHATSession::decode_address()"));
+    debug!("address is {}", address);
+
     let mut address = address.split('@');
 
-    let key = address.next()?;
-    let key = base64::decode_config(key, base64::URL_SAFE_NO_PAD).ok()?;
+    let key = address
+        .next()
+        .err_exec(|_| error!("something went wrong"))?;
+    let key = base64::decode_config(key, base64::URL_SAFE_NO_PAD)
+        .err_exec(|e| error!("{}", e))
+        .ok()?;
 
-    let hostname = address.next()?.to_string();
+    let hostname = address
+        .next()
+        .err_exec(|_| error!("wrong format"))?
+        .to_string();
 
     UserDataRaw {
         id: key,
@@ -124,8 +136,13 @@ pub fn decode_address(address: &str) -> Option<UserData> {
 }
 
 pub fn greeting_auth(auth: &[u8]) -> Option<[u8; 16]> {
+    trace!("greeting_auth() is called");
+    defer!(trace!("returning from greeting_auth()"));
+
     let mut auth = Cursor::new(auth);
     let auth = byteorder::ReadBytesExt::read_u128::<BigEndian>(&mut auth).ok()?;
+    debug!("authentication message is {}", auth);
+
     Some(auth.to_le_bytes())
 }
 
