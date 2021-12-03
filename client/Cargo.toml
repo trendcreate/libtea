@@ -26,6 +26,7 @@ edition = "2021"
 
 [dependencies]
 dirs = "3"
+rand = "0.8"
 env_logger = "0.9"
 
 [dependencies.libtea]

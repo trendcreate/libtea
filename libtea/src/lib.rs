@@ -438,11 +438,6 @@ impl RYOKUCHATSession {
             return None;
         }
 
-        if msg.contains("自殺") {
-            error!("こころの健康相談統一ダイヤル");
-            error!("+81 570-064-556");
-        }
-
         self.new_connection(id)
             .await
             .err_exec(|_| error!("failed to connect"))?;

@@ -19,9 +19,8 @@ You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
-use std::{collections::VecDeque, sync::Arc};
-
 use libtea::Message;
+use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main]
@@ -171,6 +170,12 @@ async fn chat_session(
             handle.abort();
             return;
         }
+
+        if suicide_check(input) {
+            eprintln!("相談先はこちら");
+            eprintln!("こころの健康相談統一ダイヤル");
+            eprintln!("+81 570-064-556");
+        }
         if session.send_dm(&user.id, input).await.is_none() {
             println!("Error while sending.");
         }
@@ -192,11 +197,7 @@ async fn add(session: &libtea::RYOKUCHATSession, input: &str) -> bool {
     session.add_user(address).await.is_some()
 }
 
-async fn del(
-    session: &libtea::RYOKUCHATSession,
-    data: &Vec<libtea::UserData>,
-    input: &str,
-) -> bool {
+async fn del(session: &libtea::RYOKUCHATSession, data: &[libtea::UserData], input: &str) -> bool {
     let mut hoge = input.split(' ');
     let _ = hoge.next();
     let index: usize = match hoge.next() {
@@ -210,3 +211,26 @@ async fn del(
     let user = &data[index];
     session.del_user(&user.id).await.is_some()
 }
+
+fn suicide_check(msg: &str) -> bool {
+    unsafe {
+        if WARNED {
+            // 1/3
+            if 0 < rand::rngs::OsRng.gen_range(0..3) {
+                return false;
+            }
+        }
+    }
+    for i in NG_WORD {
+        if msg.contains(i) {
+            unsafe {
+                WARNED = true;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+const NG_WORD: [&str; 2] = ["自殺", "死にたい"];
+static mut WARNED: bool = false;
