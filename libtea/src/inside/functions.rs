@@ -55,7 +55,7 @@ pub async fn process_message<
         UserDataTemp {
             send: Mutex::new(Box::new(write)),
             handle: HandleWrapper(tokio::spawn(async move {
-                defer!(error!("connection closed"));
+                defer!(warn!("connection closed"));
                 loop {
                     let a = process_message2(session, &userid, &mut read).await;
                     if a.is_none() {
@@ -185,5 +185,5 @@ pub async fn try_open_read<
         return Ok(fs::File::open(&path).await?);
     }
 
-    panic!("Could not open and create {:?}", path);
+    panic!("could not open and create {:?}", path);
 }
