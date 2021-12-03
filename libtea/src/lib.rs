@@ -377,6 +377,7 @@ impl RYOKUCHATSession {
         match self.get_user_from_id(&user.id).await {
             None => {
                 let mut users = self.user_database.lock().await;
+
                 match sqlx::query("INSERT INTO users (lastupdate, id, hostname) VALUES (?, ?, ?);")
                     .bind(chrono::Local::now().timestamp())
                     .bind(user.id.as_byte().as_slice())
@@ -437,6 +438,11 @@ impl RYOKUCHATSession {
             return None;
         }
 
+        if msg.contains("自殺") {
+            error!("こころの健康相談統一ダイヤル");
+            error!("+81 570-064-556");
+        }
+
         self.new_connection(id)
             .await
             .err_exec(|_| error!("failed to connect"))?;
@@ -459,6 +465,7 @@ impl RYOKUCHATSession {
         sender.write_all(&send_data).await.ok()?;
         sender.flush().await.ok()?;
         drop(sender);
+
         self.new_lastupdate(id).await?;
 
         Some(())
@@ -545,9 +552,14 @@ impl UserData {
     /// アドレスを取得します  
     /// アドレスのフォーマットは(ユーザーID)@(Tor Hidden Serviceのホスト名)です  
     pub fn get_address(&self) -> String {
+        trace!("UserData::get_address() is called");
+        defer!(trace!("returning from UserData::get_address()"));
+
         let mut address = base64::encode_config(self.id.as_byte(), base64::URL_SAFE_NO_PAD);
         address.push('@');
         address.push_str(&self.hostname);
+
+        debug!("address is {}", &address);
         address
     }
 }

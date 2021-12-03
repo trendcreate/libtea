@@ -44,6 +44,9 @@ pub async fn process_message<
     userid: PublicKey,
     stream: T,
 ) {
+    trace!("process_message() is called.");
+    defer!(trace!("reterning from process_message()"));
+
     let session = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(session) };
     let (mut read, write) = tokio::io::split(stream);
 
@@ -76,41 +79,61 @@ async fn process_message2<
     userid: &PublicKey,
     read: &mut T,
 ) -> Option<()> {
+    trace!("process_message2() is called.");
+    defer!(trace!("reterning from process_message2()"));
+
     // メッセージのサイズを受信
     let mut len = [0; 8];
     read.read_exact(&mut len).await.ok()?;
+    debug!("new message come");
+
     let mut len = Cursor::new(len);
-    let len = byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len).ok()?;
-    let len: usize = TryFrom::try_from(len).ok()?;
-    if len < MAXMSGLEN {
-        let mut msg = vec![0; len];
-        read.read_exact(&mut msg).await.ok()?;
-        let msg: MessageForNetwork = bincode::deserialize(&msg).ok()?;
-        match msg {
-            MessageForNetwork::DirectMsg(msg) => {
-                // stub: メッセージ履歴の保存を実装
-                if msg.is_empty() {
-                    return None;
-                }
+    let len = byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len)
+        .err_exec(|e| error!("{}", e))
+        .ok()?;
+    let len: usize = TryFrom::try_from(len)
+        .err_exec(|_| error!("32bit CPUs are not officially supported"))
+        .ok()?;
+    debug!("new message's size is {} byte", len);
 
-                session.new_lastupdate(userid).await?;
+    if len >= MAXMSGLEN {
+        error!("message's size must be under 126000");
+        return None;
+    }
 
-                match &mut *session.notify.lock().await {
-                    Some(s) => {
-                        let _ = s.send(Message::DirectMsg(userid.clone(), msg)).await;
-                    }
-                    None => (),
-                }
-                return Some(());
+    let mut msg = vec![0; len];
+    read.read_exact(&mut msg).await.ok()?;
+    let msg: MessageForNetwork = bincode::deserialize(&msg)
+        .err_exec(|_| error!("wrong message format"))
+        .ok()?;
+    match msg {
+        MessageForNetwork::DirectMsg(msg) => {
+            // stub: メッセージ履歴の保存を実装
+            if msg.is_empty() {
+                error!("empty message is not allowed");
+                return None;
             }
+            session.new_lastupdate(userid).await?;
+
+            match &mut *session.notify.lock().await {
+                Some(s) => {
+                    let _ = s.send(Message::DirectMsg(userid.clone(), msg)).await;
+                }
+                None => {
+                    warn!("session.notify is not set");
+                }
+            }
+
+            Some(())
         }
     }
-    None
 }
 
 pub fn decode_address(address: &str) -> Option<UserData> {
     trace!("RYOKUCHATSession::decode_address() is called");
     defer!(trace!("returning from RYOKUCHATSession::decode_address()"));
+
+    let address = address.trim();
     debug!("address is {}", address);
 
     let mut address = address.split('@');
