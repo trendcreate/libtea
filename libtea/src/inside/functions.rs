@@ -22,7 +22,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 use std::{future::Future, io::Cursor};
 
 use byteorder::BigEndian;
-use ed448_rust::PublicKey;
+use ed448_rust::{PublicKey, SIG_LENGTH};
 use tokio::io::AsyncReadExt;
 use tokio::{
     fs,
@@ -87,6 +87,7 @@ async fn process_message2<
     read.read_exact(&mut len).await.ok()?;
     debug!("new message come");
 
+    // 受け取ったデータを処理
     let mut len = Cursor::new(len);
     let len = byteorder::ReadBytesExt::read_u64::<BigEndian>(&mut len)
         .err_exec(|e| error!("{}", e))
@@ -96,16 +97,25 @@ async fn process_message2<
         .ok()?;
     debug!("new message's size is {} byte", len);
 
+    // メッセージのサイズが最大値を超えていたらエラー
     if len >= MAXMSGLEN {
         error!("message's size must be under 126000");
         return None;
     }
 
-    let mut msg = vec![0; len];
+    // メッセージを受信(lenバイトはメッセージ本体､SIG_LENGTHバイトは署名)
+    let mut msg = vec![0; len + SIG_LENGTH];
     read.read_exact(&mut msg).await.ok()?;
-    let msg: MessageForNetwork = bincode::deserialize(&msg)
+    // 署名を検証
+    userid
+        .verify(&msg[..len], &msg[len..], None)
+        .err_exec(|e| error!("{}", e))
+        .ok()?;
+    // メッセージをデシリアライズ
+    let msg: MessageForNetwork = bincode::deserialize(&msg[..len])
         .err_exec(|_| error!("wrong message format"))
         .ok()?;
+
     match msg {
         MessageForNetwork::DirectMsg(msg) => {
             // stub: メッセージ履歴の保存を実装

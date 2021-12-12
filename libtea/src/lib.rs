@@ -438,6 +438,22 @@ impl RYOKUCHATSession {
             return None;
         }
 
+        let send_data = MessageForNetwork::DirectMsg(msg.to_string());
+        let send_data = bincode::serialize(&send_data)
+            .err_exec(|e| error!("{}", e))
+            .ok()?;
+
+        self.send(id, &send_data).await?;
+        self.new_lastupdate(id).await?;
+
+        Some(())
+    }
+
+    // 相手にデータを送信する
+    async fn send(&self, id: &PublicKey, data: &[u8]) -> Option<()> {
+        trace!("RYOKUCHATSession::send() is called");
+        defer!(trace!("returning from RYOKUCHATSession::send()"));
+
         self.new_connection(id)
             .await
             .err_exec(|_| error!("failed to connect"))?;
@@ -447,21 +463,21 @@ impl RYOKUCHATSession {
             .get(&id.as_byte())
             .err_exec(|_| error!("something went wrong"))?;
 
-        let send_data = MessageForNetwork::DirectMsg(msg.to_string());
-        let send_data = bincode::serialize(&send_data)
+        let data_sign = self
+            .myprivkey
+            .sign(data, None)
             .err_exec(|e| error!("{}", e))
             .ok()?;
 
         let mut sender = user_data_temp.send.lock().await;
         sender
-            .write_all(&(send_data.len() as u64).to_be_bytes())
+            .write_all(&(data.len() as u64).to_be_bytes())
             .await
             .ok()?;
-        sender.write_all(&send_data).await.ok()?;
+        sender.write_all(data).await.ok()?;
+        sender.write_all(&data_sign).await.ok()?;
         sender.flush().await.ok()?;
         drop(sender);
-
-        self.new_lastupdate(id).await?;
 
         Some(())
     }
