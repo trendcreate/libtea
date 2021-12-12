@@ -3,7 +3,7 @@ RYOKUCHATは、匿名化ネットワーク「Tor」を用いて通信するチ�
 RYOKUCHATのソースコードは、通信システムとGUIクライアントに分かれています。
 現在は、リリースはしておりませんが、libteaのソースコードをコンパイルして使用可能です。
 
-## <a href="https://github.com/trendcreate/RYOKUCHAT">libtea</a>
+## <a href="https://github.com/trendcreate/libtea">libtea</a>
 libteaは、RYOKUCHAT内の他の人やサーバーとの通信を行う部分です。
 
 ## <a href="https://github.com/trendcreate/ryokuchat-gui">RYOKUCHAT GUI</a>

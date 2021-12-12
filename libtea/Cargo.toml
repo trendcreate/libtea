@@ -35,7 +35,7 @@ log = "0.4"
 git = "https://github.com/pdh11/ed448-rust.git"
 
 [dependencies.libtor]
-git = "https://github.com/WinLinux1028/libtor.git"
+git = "https://github.com/MagicalBitcoin/libtor.git"
 features = ["vendored-openssl", "vendored-lzma", "vendored-zstd"]
 
 # bincodeに合わせて更新
