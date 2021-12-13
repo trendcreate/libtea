@@ -29,7 +29,7 @@ extern crate log;
 use crate::{
     consts::{KEY_LENGTH, SIG_LENGTH},
     inside::{
-        functions::{decode_address, greeting_auth, process_message, try_open_read},
+        functions::{decode_address, greeting_auth, passwd_gen, process_message, try_open_read},
         structs::{ErrMsg, HandleWrapper, MessageForNetwork, UserDataRaw, UserDataTemp},
     },
 };
@@ -41,7 +41,7 @@ use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     process::Command,
     sync::{mpsc::Sender, Mutex, RwLock},
 };
@@ -82,8 +82,10 @@ impl RYOKUCHATSession {
         // それぞれの用途のポート番号を決める
         let ryokuchat_port = port;
         let socks_port = port + 1;
+        let control_port = port + 2;
         debug!("ryokuchat_port is {}", ryokuchat_port);
         debug!("socks_port is {}", socks_port);
+        debug!("control_port is {}", control_port);
 
         // localhostのアドレスを取得
         let localhost = match tokio::net::lookup_host("localhost:1")
@@ -159,6 +161,9 @@ impl RYOKUCHATSession {
         debug!("DataDirectory of Tor is {:?}", &tor_dir);
         debug!("HiddenServiceDir of Tor is {:?}", &hidden_dir);
         debug!("ConfigFile of Tor is {:?}", &tor_config);
+        let control_passwd = passwd_gen();
+        let control_passwd2 = control_passwd.clone();
+        debug!("control_passwd is {:?}", &tor_config);
         let localhost2 = localhost.clone();
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
@@ -181,6 +186,13 @@ impl RYOKUCHATSession {
                     TorAddress::AddressPort(localhost2.clone(), socks_port),
                     None.into(),
                     None.into(),
+                ))
+                .flag(TorFlag::ControlPortAddress(
+                    TorAddress::AddressPort(localhost2, control_port),
+                    None.into(),
+                ))
+                .flag(TorFlag::HashedControlPassword(
+                    libtor::generate_hashed_password(&control_passwd2),
                 ))
                 .flag(TorFlag::ExcludeNodes(vec!["SlowServer".to_string()].into()))
                 .flag(TorFlag::StrictNodes(true.into()))
@@ -234,13 +246,25 @@ impl RYOKUCHATSession {
         let mut session = Box::new(RYOKUCHATSession {
             handles: vec![HandleWrapper(torhandle)],
             myprivkey: secretkey,
-            localhost,
+            localhost: localhost.clone(),
             socks_port,
             user_database: Mutex::const_new(sqlite),
             user_data_temp: RwLock::const_new(HashMap::new()),
             notify: Mutex::const_new(None),
             myaddress: address,
         });
+
+        // let handle = tokio::spawn(async move {
+        //     let mut stream;
+        //     loop {
+        //         stream = match TcpStream::connect(format!("{}:{}", localhost, control_port)).await {
+        //             Ok(o) => o,
+        //             Err(_) => continue,
+        //         };
+        //         break;
+        //     }
+        //     // stream.write_all().await.unwrap();
+        // });
 
         // メッセージを受信するスレッドを作る
         // ライフタイムエラーを消すためにtransmuteを使っているが、RYOKUCHATSessionには書き換えられうる値にはMutexやRwLockを使っており、RYOKUCHATSessionの実体はヒープ上にあるので安全

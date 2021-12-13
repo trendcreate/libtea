@@ -23,6 +23,7 @@ use std::{future::Future, io::Cursor};
 
 use byteorder::BigEndian;
 use ed448_rust::{PublicKey, SIG_LENGTH};
+use rand::Rng;
 use tokio::io::AsyncReadExt;
 use tokio::{
     fs,
@@ -196,4 +197,23 @@ pub async fn try_open_read<
     }
 
     panic!("could not open and create {:?}", path);
+}
+
+pub fn passwd_gen() -> String {
+    let mut passwd = String::with_capacity(32);
+    for _ in 0..32 {
+        let mut random: u32 = rand::rngs::OsRng.gen_range(0..62);
+        random = if random < 10 {
+            rand::rngs::OsRng.gen_range(48..=57)
+        } else if random < 36 {
+            rand::rngs::OsRng.gen_range(65..=90)
+        } else {
+            rand::rngs::OsRng.gen_range(97..=122)
+        };
+        unsafe {
+            passwd.push(std::mem::transmute(random));
+        }
+    }
+    debug!("generated password is {}", &passwd);
+    passwd
 }
