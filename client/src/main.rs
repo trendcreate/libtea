@@ -35,7 +35,6 @@ async fn main() {
     println!();
 
     main2().await;
-    std::process::exit(0);
 }
 
 async fn main2() {

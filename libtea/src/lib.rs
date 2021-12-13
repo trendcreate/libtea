@@ -38,15 +38,14 @@ use std::{collections::HashMap, convert::TryFrom, net::IpAddr, path::PathBuf, ti
 
 use ed448_rust::{PrivateKey, PublicKey};
 use libtor::{HiddenServiceVersion, Tor, TorAddress, TorFlag};
+use rand::Rng;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
     process::Command,
     sync::{mpsc::Sender, Mutex, RwLock},
 };
-
-use rand::Rng;
 
 use sqlx::{Connection, Executor};
 
@@ -163,7 +162,7 @@ impl RYOKUCHATSession {
         debug!("ConfigFile of Tor is {:?}", &tor_config);
         let control_passwd = passwd_gen();
         let control_passwd2 = control_passwd.clone();
-        debug!("control_passwd is {:?}", &tor_config);
+        debug!("control_passwd is {:?}", &control_passwd);
         let localhost2 = localhost.clone();
         let torhandle = tokio::task::spawn_blocking(move || {
             Tor::new()
@@ -254,17 +253,29 @@ impl RYOKUCHATSession {
             myaddress: address,
         });
 
-        // let handle = tokio::spawn(async move {
-        //     let mut stream;
-        //     loop {
-        //         stream = match TcpStream::connect(format!("{}:{}", localhost, control_port)).await {
-        //             Ok(o) => o,
-        //             Err(_) => continue,
-        //         };
-        //         break;
-        //     }
-        //     // stream.write_all().await.unwrap();
-        // });
+        let handle = tokio::spawn(async move {
+            let mut stream;
+            loop {
+                stream = match TcpStream::connect(format!("{}:{}", localhost, control_port)).await {
+                    Ok(o) => BufStream::new(o),
+                    Err(_) => continue,
+                };
+                break;
+            }
+            stream.write_all(b"AUTHENTICATE \"").await.unwrap();
+            stream.write_all(control_passwd.as_bytes()).await.unwrap();
+            stream.write_all(b"\"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut a = String::new();
+            stream.read_line(&mut a).await.unwrap();
+            stream.write_all(b"TAKEOWNERSHIP\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            stream.read_line(&mut a).await.unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+            }
+        });
+        session.handles.push(HandleWrapper(handle));
 
         // メッセージを受信するスレッドを作る
         // ライフタイムエラーを消すためにtransmuteを使っているが、RYOKUCHATSessionには書き換えられうる値にはMutexやRwLockを使っており、RYOKUCHATSessionの実体はヒープ上にあるので安全
