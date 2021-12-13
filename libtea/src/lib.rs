@@ -253,6 +253,7 @@ impl RYOKUCHATSession {
             myaddress: address,
         });
 
+        // RYOKUCHATSessionがdropされたときにTorを終了するためのスレッド
         let handle = tokio::spawn(async move {
             let mut stream;
             loop {
@@ -277,7 +278,7 @@ impl RYOKUCHATSession {
         });
         session.handles.push(HandleWrapper(handle));
 
-        // メッセージを受信するスレッドを作る
+        // メッセージを受信するスレッド
         // ライフタイムエラーを消すためにtransmuteを使っているが、RYOKUCHATSessionには書き換えられうる値にはMutexやRwLockを使っており、RYOKUCHATSessionの実体はヒープ上にあるので安全
         let s = unsafe { std::mem::transmute::<&RYOKUCHATSession, &RYOKUCHATSession>(&*session) };
         let handle = tokio::spawn(async move {
